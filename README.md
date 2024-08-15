@@ -97,7 +97,7 @@ Modula provides two useful abstractions: the `Vector` class and the `Module` cla
 
 ### The `Vector` class
 
-The `Vector` class is used to store the weights of the neural net. For instance, in the previous example the line `weights = mlp.initialize(device="cpu")` creates a `Vector` called `weights`. And `grad = weights.grad()` stores the gradient of `weights` as a `Vector` called `grad`. The point of all this as that you can do operations on `Vector` objects like:
+The `Vector` class is used to store the weights of the neural net. For instance, in the previous example the line `weights = mlp.initialize(device="cpu")` creates a `Vector` called `weights`. And `grad = weights.grad()` stores the gradient of `weights` as a `Vector` called `grad`. The point of all this is that you can do operations on `Vector` objects like:
 ```python
 weights -= 0.1 * grad
 ```

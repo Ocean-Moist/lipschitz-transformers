@@ -2,8 +2,9 @@ import argparse
 import json
 import math
 import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 import jax
 import jax.numpy as jnp
@@ -154,10 +155,12 @@ def run_one(config_dict: Dict[str, Any]):
     }
 
 
-def plot_run(history: Dict[str, Any], title: str, out_dir: Path):
+def plot_run(history: Dict[str, Any], file_prefix: str, out_dir: Path, display_title: Optional[str] = None):
     steps = history["steps"]
     losses = history["train_losses"]
     cs = history["ebc_c"]
+
+    title = display_title or file_prefix
 
     plt.figure(figsize=(8, 5))
     plt.plot(steps, losses)
@@ -165,7 +168,7 @@ def plot_run(history: Dict[str, Any], title: str, out_dir: Path):
     plt.ylabel("Train loss")
     plt.title(title)
     plt.tight_layout()
-    plt.savefig(out_dir / f"{title}_loss.png", dpi=160)
+    plt.savefig(out_dir / f"{file_prefix}_loss.png", dpi=160)
 
     if any(c is not None for c in cs):
         plt.figure(figsize=(8, 3))
@@ -175,7 +178,31 @@ def plot_run(history: Dict[str, Any], title: str, out_dir: Path):
         plt.ylim(0, 1.05)
         plt.title(f"{title} clip factor")
         plt.tight_layout()
-        plt.savefig(out_dir / f"{title}_clip.png", dpi=160)
+        plt.savefig(out_dir / f"{file_prefix}_clip.png", dpi=160)
+
+
+def job_label(meta: Dict[str, Any]) -> str:
+    base = f"{meta['optimizer']}_{meta['spectral']}"
+    if meta["ebc"] == "off":
+        return f"{base}_baseline"
+    delta = meta.get("delta")
+    agg = meta.get("aggregate")
+    delta_str = "na" if delta is None else str(delta).replace(".", "p")
+    agg_str = agg or ""
+    return f"{base}_ebc_d{delta_str}_{agg_str}"
+
+
+def job_display(meta: Dict[str, Any]) -> str:
+    base = f"{meta['optimizer']} ({meta['spectral']})"
+    if meta["ebc"] == "off":
+        return f"{base} baseline"
+    return f"{base} EBC δ={meta.get('delta')} {meta.get('aggregate')}"
+
+
+def _run_task(task: Tuple[Dict[str, Any], Dict[str, Any]]):
+    meta, cfg = task
+    res = run_one(cfg)
+    return meta, res
 
 
 def main():
@@ -209,6 +236,7 @@ def main():
     p.add_argument("--ebc", type=str, default="off,on", help="off or on, comma-separated")
     p.add_argument("--deltas", type=str, default="0.05,0.1", help="EBC KL targets when ebc=on")
     p.add_argument("--aggregates", type=str, default="l1", help="EBC aggregates when ebc=on (comma: l1,l2)")
+    p.add_argument("--workers", type=int, default=1, help="Number of parallel processes to run")
 
     args = p.parse_args()
     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -221,27 +249,49 @@ def main():
     deltas = [float(s.strip()) for s in args.deltas.split(",") if s.strip()]
     aggregates = [s.strip() for s in args.aggregates.split(",") if s.strip()]
 
-    summary_rows = []
+    summary_rows: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     print("optimizer,spectral,ebc,delta,aggregate,wall_clock,val_loss,val_acc,ppl,accept_rate,avg_c")
 
+    tasks: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     for opt in optimizers:
         for spec in spectral_opts:
             spec_bool = spec == "spec"
-            # Always run baseline
+            meta = {"optimizer": opt, "spectral": spec, "ebc": "off", "delta": None, "aggregate": None}
             cfg = make_config(args, opt, ebc=False, spectral=spec_bool)
-            res = run_one(cfg)
-            summary_rows.append((opt, spec, "off", None, None, res))
-            print(f"{opt},{spec},off,,,{res['wall_clock']:.2f},{res['val_loss']:.4f},{res['val_acc']:.4f},{res['ppl']:.2f},{res['accept_rate']},{res['avg_c']}")
-            plot_run(res["history"], f"{opt}_{spec}_baseline", out_dir)
+            tasks.append((meta, cfg))
 
             if "on" in ebc_opts:
                 for delta in deltas:
                     for agg in aggregates:
+                        meta = {
+                            "optimizer": opt,
+                            "spectral": spec,
+                            "ebc": "on",
+                            "delta": delta,
+                            "aggregate": agg,
+                        }
                         cfg = make_config(args, opt, ebc=True, spectral=spec_bool, delta=delta, aggregate=agg)
-                        res = run_one(cfg)
-                        summary_rows.append((opt, spec, "on", delta, agg, res))
-                        print(f"{opt},{spec},on,{delta},{agg},{res['wall_clock']:.2f},{res['val_loss']:.4f},{res['val_acc']:.4f},{res['ppl']:.2f},{res['accept_rate']},{res['avg_c']}")
-                        plot_run(res["history"], f"{opt}_{spec}_ebc_d{delta}_{agg}", out_dir)
+                        tasks.append((meta, cfg))
+
+    def handle_result(meta: Dict[str, Any], res: Dict[str, Any]):
+        summary_rows.append((meta, res))
+        accept_display = "" if res["accept_rate"] is None else f"{res['accept_rate']:.2f}"
+        avgc_display = "" if res["avg_c"] is None else f"{res['avg_c']:.3f}"
+        print(
+            f"{meta['optimizer']},{meta['spectral']},{meta['ebc']},{meta.get('delta')},{meta.get('aggregate')},{res['wall_clock']:.2f},{res['val_loss']:.4f},{res['val_acc']:.4f},{res['ppl']:.2f},{accept_display},{avgc_display}"
+        )
+        label = job_label(meta)
+        title = job_display(meta)
+        plot_run(res["history"], label, out_dir, title)
+
+    if args.workers > 1:
+        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+            for meta, res in pool.map(_run_task, tasks):
+                handle_result(meta, res)
+    else:
+        for meta, cfg in tasks:
+            res = run_one(cfg)
+            handle_result(meta, res)
 
     # Save CSV summary
     csv_path = out_dir / "summary.csv"
@@ -254,11 +304,11 @@ def main():
 
     # Simple Pareto: val PPL vs avg clip (EBC only)
     xs, ys, labels = [], [], []
-    for opt, spec, ebc_flag, delta, agg, res in summary_rows:
-        if ebc_flag == "on" and res["avg_c"] is not None:
+    for meta, res in summary_rows:
+        if meta["ebc"] == "on" and res["avg_c"] is not None:
             xs.append(res["avg_c"])  # larger avg_c -> less clipping
             ys.append(res["ppl"])
-            labels.append(f"{opt}-{spec}-d{delta}-{agg}")
+            labels.append(f"{meta['optimizer']}-{meta['spectral']}-d{meta['delta']}-{meta['aggregate']}")
 
     if xs:
         plt.figure(figsize=(6, 4))
@@ -277,14 +327,14 @@ def main():
         json.dump(
             [
                 {
-                    "optimizer": opt,
-                    "spectral": spec,
-                    "ebc": ebc_flag,
-                    "delta": delta,
-                    "aggregate": agg,
+                    "optimizer": meta["optimizer"],
+                    "spectral": meta["spectral"],
+                    "ebc": meta["ebc"],
+                    "delta": meta["delta"],
+                    "aggregate": meta["aggregate"],
                     "metrics": res,
                 }
-                for opt, spec, ebc_flag, delta, agg, res in summary_rows
+                for meta, res in summary_rows
             ],
             f,
             indent=2,
@@ -295,4 +345,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

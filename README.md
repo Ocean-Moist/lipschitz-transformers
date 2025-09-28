@@ -91,6 +91,8 @@ python -m scripts.run_shakespeare_ebc_ablation \
   --num_blocks 3 --d_embed 128 --num_heads 4 \
   --optimizers adam,muon --spectral none,spec --ebc off,on \
   --deltas 0.05,0.1 --aggregates l1
+
+Add `--workers 4` (for example) to run configurations in parallel processes; keep it at 1 if GPU memory is tight.
 ```
 
 Outputs are saved under `outputs/ebc_ablation/<timestamp>/`:

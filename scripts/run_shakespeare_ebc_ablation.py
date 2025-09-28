@@ -1,10 +1,15 @@
 import argparse
 import json
 import math
+import os
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
+
+# Ensure matplotlib cache path is writable before importing pyplot
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/mplconfig")
+Path(os.environ["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
 
 import jax
 import jax.numpy as jnp
@@ -251,6 +256,13 @@ def main():
 
     summary_rows: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     print("optimizer,spectral,ebc,delta,aggregate,wall_clock,val_loss,val_acc,ppl,accept_rate,avg_c")
+
+    # Warm dataset once (avoids parallel download race producing empty memmaps)
+    warm_cfg_dict = make_config(args, optimizers[0], ebc=False, spectral=False)
+    warm_config = parse_config_from_json(warm_cfg_dict)
+    _warm_train, _warm_val, _ = get_data_loader(warm_config)
+    del _warm_train
+    del _warm_val
 
     tasks: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     for opt in optimizers:

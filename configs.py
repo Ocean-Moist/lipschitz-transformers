@@ -45,4 +45,32 @@ def parse_config_from_json(config_dict):
     config.dtype = DTYPES[config.model_dtype]
     config.project_dtype = DTYPES[config.project_dtype]
 
+    # EBC defaults
+    if not hasattr(config, "ebc_enable"):
+        config.ebc_enable = False
+    if not hasattr(config, "ebc_target_kl"):
+        config.ebc_target_kl = 0.05  # nats/token
+    if not hasattr(config, "ebc_update_every"):
+        config.ebc_update_every = 20
+    if not hasattr(config, "ebc_probe_layers"):
+        config.ebc_probe_layers = 2
+    if not hasattr(config, "ebc_beta_ema"):
+        config.ebc_beta_ema = 0.9
+    if not hasattr(config, "ebc_safety"):
+        config.ebc_safety = 1.05
+    if not hasattr(config, "ebc_aggregate"):
+        config.ebc_aggregate = "l1"
+    if not hasattr(config, "ebc_center_logits"):
+        config.ebc_center_logits = True
+    if not hasattr(config, "ebc_include_embed_out"):
+        config.ebc_include_embed_out = False
+
+    # Trainer defaults
+    if not hasattr(config, "pre_dualize"):
+        config.pre_dualize = False
+    if not hasattr(config, "post_dualize"):
+        config.post_dualize = False
+    if not hasattr(config, "jit"):
+        config.jit = True
+
     return config

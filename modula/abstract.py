@@ -99,6 +99,15 @@ class Module:
     def __call__(self, x, w):
         return self.forward(x, w)
 
+    # ---- Introspection helpers (non-JIT), used by tooling like EBC tests ----
+    def trackers(self):
+        """Return a flat list of tracker labels for each Atom weight in order.
+
+        The order matches the flattened weight list returned by initialize/project.
+        Bonds (non-parameter modules) contribute no trackers.
+        """
+        raise NotImplementedError
+
 
 class Atom(Module):
     def __init__(self, tracker=None):
@@ -138,6 +147,11 @@ class Atom(Module):
         )
         return w_projected
 
+    def trackers(self):
+        # Single weight per Atom; use tracker label if provided
+        label = self.tracker if getattr(self, "tracker", None) else ""
+        return [label]
+
 
 class Bond(Module):
     def __init__(self):
@@ -173,6 +187,9 @@ class Bond(Module):
 
     def log(self, w, grad_w):
         return {}
+
+    def trackers(self):
+        return []
 
 
 class CompositeModule(Module):
@@ -286,6 +303,10 @@ class CompositeModule(Module):
         grad_w1 = grad_w[m0.atoms :]
         return m0.log(w0, grad_w0) | m1.log(w1, grad_w1)
 
+    def trackers(self):
+        m0, m1 = self.children
+        return m0.trackers() + m1.trackers()
+
 
 class TupleModule(Module):
     def __init__(self, python_tuple_of_modules):
@@ -390,6 +411,12 @@ class TupleModule(Module):
             w = w[m.atoms :]
             grad_w = grad_w[m.atoms :]
         return log_info
+
+    def trackers(self):
+        labels = []
+        for m in self.children:
+            labels += m.trackers()
+        return labels
 
 
 class Identity(Bond):

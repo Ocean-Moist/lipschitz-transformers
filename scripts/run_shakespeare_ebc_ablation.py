@@ -1,0 +1,298 @@
+import argparse
+import json
+import math
+import time
+from pathlib import Path
+from typing import Dict, Any, List, Tuple
+
+import jax
+import jax.numpy as jnp
+import matplotlib.pyplot as plt
+
+from configs import parse_config_from_json
+from data_loaders import get_data_loader
+from models import create_model
+from optimizers import get_optimizer
+from trainer import Trainer
+
+
+class AblationLogger:
+    def __init__(self, config):
+        self.config = config
+        self.steps: List[int] = []
+        self.losses: List[float] = []
+        self.train_accs: List[float] = []
+        self.ebc_c: List[float] = []
+        self.wall_times: List[float] = []
+        self._t0 = time.time()
+
+    def log_training(self, step, loss, accuracy, log):
+        self.steps.append(int(step))
+        self.losses.append(float(loss))
+        self.train_accs.append(float(accuracy))
+        c = None
+        if isinstance(log, dict) and "ebc" in log and isinstance(log["ebc"], dict):
+            c = log["ebc"].get("c")
+        self.ebc_c.append(None if c is None else float(c))
+        self.wall_times.append(time.time() - self._t0)
+
+    def log_validation(self, step, metrics):
+        # For now we rely on final validate() at the end
+        pass
+
+    def get_results(self):
+        return {
+            "steps": self.steps,
+            "train_losses": self.losses,
+            "train_accs": self.train_accs,
+            "ebc_c": self.ebc_c,
+            "wall_times": self.wall_times,
+        }
+
+
+def make_config(args, optimizer: str, ebc: bool, spectral: bool, delta: float = None, aggregate: str = None):
+    # Project mapping
+    if spectral:
+        project = {"default": "spec_normalize"}
+    else:
+        project = {"default": "none"}
+
+    cfg = dict(
+        # Data/model
+        data="shakespeare",
+        vocab_size=args.vocab_size,
+        num_heads=args.num_heads,
+        d_embed=args.d_embed,
+        num_blocks=args.num_blocks,
+        softmax_scale=1.0,
+        final_scale=1.0,
+        residual_scale=1.0,
+        scales_learnable=False,
+        zero_init=False,
+        max_embed_inflation_factor=1.0,
+        use_unembed=True,
+        layernorm_substitute="none",
+        # Train
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        steps=args.steps,
+        accum_steps=1,
+        lr=args.lr,
+        wd=args.wd,
+        spectral_wd=0.0,
+        w_max=1.0,
+        schedule="none",
+        log_interval=args.log_interval,
+        val_interval=args.val_interval,
+        val_iters=args.val_iters,
+        num_checkpoints=0,
+        seed=args.seed,
+        # Optimizer
+        optimizer=optimizer,
+        beta1=0.9,
+        beta2=0.999,
+        # Dtypes
+        model_dtype="float32",
+        project_dtype="float32",
+        project=project,
+        # EBC
+        ebc_enable=bool(ebc),
+        ebc_target_kl=args.ebc_target_kl if delta is None else delta,
+        ebc_update_every=args.ebc_update_every,
+        ebc_probe_layers=args.ebc_probe_layers,
+        ebc_beta_ema=args.ebc_beta_ema,
+        ebc_safety=args.ebc_safety,
+        ebc_aggregate=args.ebc_aggregate if aggregate is None else aggregate,
+        ebc_center_logits=True,
+        ebc_include_embed_out=False,
+        # Misc
+        jit=False,  # keep False to avoid Rope cache tracer issues under JIT
+        output_dir=str(args.output_dir),
+    )
+    return cfg
+
+
+def run_one(config_dict: Dict[str, Any]):
+    config = parse_config_from_json(config_dict)
+    train_loader, val_loader, loss_fn = get_data_loader(config)
+    model = create_model(config)
+    optimizer = get_optimizer(config)
+
+    logger = AblationLogger(config)
+    key = jax.random.PRNGKey(config.seed)
+    key, sub = jax.random.split(key)
+    params = model.initialize(sub)
+    opt_state = optimizer.init_state(params)
+
+    trainer = Trainer(model, optimizer, train_loader, val_loader, loss_fn, config, logger)
+
+    t0 = time.time()
+    params, opt_state, key = trainer.train(params, opt_state, key)
+    wall_clock = time.time() - t0
+
+    # Final validation
+    val_metrics = trainer.validate(params)
+    ppl = float(math.exp(float(val_metrics["loss"])) if val_metrics["loss"] < 20 else float("inf"))
+
+    history = logger.get_results()
+    # Accept rate / avg clip
+    cs = [c for c in history["ebc_c"] if c is not None]
+    accept_rate = None
+    avg_c = None
+    if cs:
+        accept_rate = float(sum(1 for c in cs if c >= 0.999) / len(cs))
+        avg_c = float(sum(cs) / len(cs))
+
+    return {
+        "wall_clock": wall_clock,
+        "val_loss": float(val_metrics["loss"]),
+        "val_acc": float(val_metrics["accuracy"]),
+        "ppl": ppl,
+        "history": history,
+        "accept_rate": accept_rate,
+        "avg_c": avg_c,
+    }
+
+
+def plot_run(history: Dict[str, Any], title: str, out_dir: Path):
+    steps = history["steps"]
+    losses = history["train_losses"]
+    cs = history["ebc_c"]
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(steps, losses)
+    plt.xlabel("Step")
+    plt.ylabel("Train loss")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(out_dir / f"{title}_loss.png", dpi=160)
+
+    if any(c is not None for c in cs):
+        plt.figure(figsize=(8, 3))
+        plt.plot(steps, [1.0 if c is None else c for c in cs])
+        plt.xlabel("Step")
+        plt.ylabel("c (clip)")
+        plt.ylim(0, 1.05)
+        plt.title(f"{title} clip factor")
+        plt.tight_layout()
+        plt.savefig(out_dir / f"{title}_clip.png", dpi=160)
+
+
+def main():
+    p = argparse.ArgumentParser(description="Shakespeare EBC ablation")
+    p.add_argument("--output_dir", type=Path, default=Path("outputs/ebc_ablation"))
+    # Model/data
+    p.add_argument("--vocab_size", type=int, default=65)
+    p.add_argument("--num_heads", type=int, default=4)
+    p.add_argument("--d_embed", type=int, default=128)
+    p.add_argument("--num_blocks", type=int, default=3)
+    p.add_argument("--seq_len", type=int, default=256)
+    p.add_argument("--batch_size", type=int, default=64)
+    # Train
+    p.add_argument("--steps", type=int, default=1000)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--wd", type=float, default=0.0)
+    p.add_argument("--log_interval", type=int, default=20)
+    p.add_argument("--val_interval", type=int, default=200)
+    p.add_argument("--val_iters", type=int, default=5)
+    p.add_argument("--seed", type=int, default=0)
+    # EBC defaults
+    p.add_argument("--ebc_target_kl", type=float, default=0.05)
+    p.add_argument("--ebc_update_every", type=int, default=20)
+    p.add_argument("--ebc_probe_layers", type=int, default=2)
+    p.add_argument("--ebc_beta_ema", type=float, default=0.9)
+    p.add_argument("--ebc_safety", type=float, default=1.05)
+    p.add_argument("--ebc_aggregate", type=str, default="l1", choices=["l1", "l2"])
+    # Grid options
+    p.add_argument("--optimizers", type=str, default="adam,muon")
+    p.add_argument("--spectral", type=str, default="none,spec", help="none or spec, comma-separated")
+    p.add_argument("--ebc", type=str, default="off,on", help="off or on, comma-separated")
+    p.add_argument("--deltas", type=str, default="0.05,0.1", help="EBC KL targets when ebc=on")
+    p.add_argument("--aggregates", type=str, default="l1", help="EBC aggregates when ebc=on (comma: l1,l2)")
+
+    args = p.parse_args()
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    out_dir = args.output_dir / timestamp
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    optimizers = [s.strip() for s in args.optimizers.split(",") if s.strip()]
+    spectral_opts = [s.strip() for s in args.spectral.split(",") if s.strip()]
+    ebc_opts = [s.strip() for s in args.ebc.split(",") if s.strip()]
+    deltas = [float(s.strip()) for s in args.deltas.split(",") if s.strip()]
+    aggregates = [s.strip() for s in args.aggregates.split(",") if s.strip()]
+
+    summary_rows = []
+    print("optimizer,spectral,ebc,delta,aggregate,wall_clock,val_loss,val_acc,ppl,accept_rate,avg_c")
+
+    for opt in optimizers:
+        for spec in spectral_opts:
+            spec_bool = spec == "spec"
+            # Always run baseline
+            cfg = make_config(args, opt, ebc=False, spectral=spec_bool)
+            res = run_one(cfg)
+            summary_rows.append((opt, spec, "off", None, None, res))
+            print(f"{opt},{spec},off,,,{res['wall_clock']:.2f},{res['val_loss']:.4f},{res['val_acc']:.4f},{res['ppl']:.2f},{res['accept_rate']},{res['avg_c']}")
+            plot_run(res["history"], f"{opt}_{spec}_baseline", out_dir)
+
+            if "on" in ebc_opts:
+                for delta in deltas:
+                    for agg in aggregates:
+                        cfg = make_config(args, opt, ebc=True, spectral=spec_bool, delta=delta, aggregate=agg)
+                        res = run_one(cfg)
+                        summary_rows.append((opt, spec, "on", delta, agg, res))
+                        print(f"{opt},{spec},on,{delta},{agg},{res['wall_clock']:.2f},{res['val_loss']:.4f},{res['val_acc']:.4f},{res['ppl']:.2f},{res['accept_rate']},{res['avg_c']}")
+                        plot_run(res["history"], f"{opt}_{spec}_ebc_d{delta}_{agg}", out_dir)
+
+    # Save CSV summary
+    csv_path = out_dir / "summary.csv"
+    with open(csv_path, "w") as f:
+        f.write("optimizer,spectral,ebc,delta,aggregate,wall_clock,val_loss,val_acc,ppl,accept_rate,avg_c\n")
+        for opt, spec, ebc_flag, delta, agg, res in summary_rows:
+            f.write(
+                f"{opt},{spec},{ebc_flag},{'' if delta is None else delta},{'' if agg is None else agg},{res['wall_clock']:.2f},{res['val_loss']:.6f},{res['val_acc']:.6f},{res['ppl']:.3f},{res['accept_rate']},{res['avg_c']}\n"
+            )
+
+    # Simple Pareto: val PPL vs avg clip (EBC only)
+    xs, ys, labels = [], [], []
+    for opt, spec, ebc_flag, delta, agg, res in summary_rows:
+        if ebc_flag == "on" and res["avg_c"] is not None:
+            xs.append(res["avg_c"])  # larger avg_c -> less clipping
+            ys.append(res["ppl"])
+            labels.append(f"{opt}-{spec}-d{delta}-{agg}")
+
+    if xs:
+        plt.figure(figsize=(6, 4))
+        plt.scatter(xs, ys)
+        for x, y, lab in zip(xs, ys, labels):
+            plt.annotate(lab, (x, y), fontsize=8)
+        plt.xlabel("avg c (higher = fewer clips)")
+        plt.ylabel("Val perplexity")
+        plt.title("EBC: PPL vs avg clip")
+        plt.tight_layout()
+        plt.savefig(out_dir / "pareto_ppl_vs_avgc.png", dpi=160)
+
+    # Dump JSON of configs and metrics for reproducing
+    json_path = out_dir / "results.json"
+    with open(json_path, "w") as f:
+        json.dump(
+            [
+                {
+                    "optimizer": opt,
+                    "spectral": spec,
+                    "ebc": ebc_flag,
+                    "delta": delta,
+                    "aggregate": agg,
+                    "metrics": res,
+                }
+                for opt, spec, ebc_flag, delta, agg, res in summary_rows
+            ],
+            f,
+            indent=2,
+        )
+
+    print(f"Saved results to {out_dir}")
+
+
+if __name__ == "__main__":
+    main()
+

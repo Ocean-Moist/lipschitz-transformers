@@ -35,6 +35,73 @@ To run the Shakespeare transformer from a checkpoint (or check out some of our c
 
 Note: the polynomial coefficients used to implement hard cap in this repo were derived in March/April, before Leloy Kun and Jianlin Su had invented the formula for hard cap involving msign [[1](https://leloykun.github.io/ponder/spectral-clipping), [2](https://www.lakernewhouse.com/writing/muon-3)]. We're keeping the coefficients for reproducibility, but it'd be great to experiment with the recent more exact formulas!
 
+## Ellipsotope-Budgeted Clipping (EBC)
+
+EBC enforces a per-step trust region in logit space by clipping the global update using a budget that sums per-layer sensitivities times update norms. It uses:
+
+- A KL-derived target per token `delta` to compute a logit bound `tau = sqrt(4 * tokens * delta)`.
+- JVP-based estimates of layer sensitivities `beta_l = ||J_l @ U_l||` along the actual update direction, updated every N steps for K layers with EMA smoothing.
+- L1 aggregation across layers and RMS norms of updates by default.
+
+Enable EBC via config (defaults shown below):
+
+```
+{
+  "ebc_enable": true,
+  "ebc_target_kl": 0.05,           // nats/token
+  "ebc_update_every": 20,          // steps between beta updates
+  "ebc_probe_layers": 2,           // layers to probe each update
+  "ebc_beta_ema": 0.9,             // EMA smoothing for beta
+  "ebc_safety": 1.05,              // conservative multiplier on beta
+  "ebc_aggregate": "l1",          // or "l2"
+  "ebc_center_logits": true,       // per-token centering
+  "ebc_include_embed_out": false   // exclude embed/out from budget
+}
+```
+
+When enabled, EBC integrates transparently in `Trainer` before weight decay/projection, and logs internal state (`tau`, `S`, `c`) at training log intervals.
+
+### Minimal ablation runner
+
+For a quick comparison over small synthetic LM data (no downloads), use:
+
+```
+python -m scripts.ablate_ebc
+```
+
+This sweeps a small grid over optimizer × EBC × spectral (Adam/Muon × off/on × off/on) on a toy GPT and prints a CSV line per run:
+
+```
+optimizer,ebc,spectral,final_loss,final_acc,ebc_c
+adam,0,0, ...
+adam,1,0, ...
+muon,0,1, ...
+muon,1,1, ...
+```
+
+For real datasets (Shakespeare/FineWeb), enable EBC in your sweep configs and run via `main.py` as usual.
+
+### Shakespeare ablation (GPU‑friendly)
+
+Run a small grid over optimizer × spectral × EBC on Shakespeare with logging and figures:
+
+```
+python -m scripts.run_shakespeare_ebc_ablation \
+  --steps 2000 --batch_size 64 --seq_len 256 \
+  --num_blocks 3 --d_embed 128 --num_heads 4 \
+  --optimizers adam,muon --spectral none,spec --ebc off,on \
+  --deltas 0.05,0.1 --aggregates l1
+```
+
+Outputs are saved under `outputs/ebc_ablation/<timestamp>/`:
+- `summary.csv` and `results.json` with metrics (wall‑clock, val loss/acc/PPL, accept‑rate, avg clip)
+- Per‑run loss and clip curves: `<optimizer>_<spectral>_baseline_*` and `..._ebc_d<δ>_<agg>_*`
+- A simple Pareto figure `pareto_ppl_vs_avgc.png` (val PPL vs average clip factor)
+
+Notes:
+- The ablation uses `jit=False` by default to avoid stateful Rope cache issues under JIT. For stable configs or after refactoring Rope caching, you can enable JIT via config in your own scripts.
+- Internet access is required once to fetch Shakespeare data; subsequent runs use the local cache.
+
 ### The real deal: 145M parameter NanoGPT
 
 The [modded NanoGPT](https://github.com/KellerJordan/modded-nanogpt) repo by Keller Jordan has a wonderful script that trains a GPT-2 small scale transformer in under 3 minutes on an 8xH100. We modified the script to enforce Lipschitz constraints. You can run the script with `/nanogpt/run.sh` -- see the subdirectory's README for setup instructions. There's a default spectral cap example, plus a spectral normalization example.

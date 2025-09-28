@@ -12,6 +12,10 @@ from typing import Dict, Any, List, Tuple, Optional
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/mplconfig")
 Path(os.environ["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
 
+# Avoid JAX processes greedily reserving nearly all GPU memory per worker
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.22")
+
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt

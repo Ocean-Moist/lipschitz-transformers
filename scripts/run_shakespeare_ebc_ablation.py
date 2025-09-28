@@ -3,6 +3,7 @@ import json
 import math
 import os
 import time
+import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
@@ -297,7 +298,8 @@ def main():
         plot_run(res["history"], label, out_dir, title)
 
     if args.workers > 1:
-        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        ctx = mp.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=args.workers, mp_context=ctx) as pool:
             for meta, res in pool.map(_run_task, tasks):
                 handle_result(meta, res)
     else:
@@ -309,9 +311,9 @@ def main():
     csv_path = out_dir / "summary.csv"
     with open(csv_path, "w") as f:
         f.write("optimizer,spectral,ebc,delta,aggregate,wall_clock,val_loss,val_acc,ppl,accept_rate,avg_c\n")
-        for opt, spec, ebc_flag, delta, agg, res in summary_rows:
+        for meta, res in summary_rows:
             f.write(
-                f"{opt},{spec},{ebc_flag},{'' if delta is None else delta},{'' if agg is None else agg},{res['wall_clock']:.2f},{res['val_loss']:.6f},{res['val_acc']:.6f},{res['ppl']:.3f},{res['accept_rate']},{res['avg_c']}\n"
+                f"{meta['optimizer']},{meta['spectral']},{meta['ebc']},{'' if meta['delta'] is None else meta['delta']},{'' if meta['aggregate'] is None else meta['aggregate']},{res['wall_clock']:.2f},{res['val_loss']:.6f},{res['val_acc']:.6f},{res['ppl']:.3f},{res['accept_rate']},{res['avg_c']}\n"
             )
 
     # Simple Pareto: val PPL vs avg clip (EBC only)

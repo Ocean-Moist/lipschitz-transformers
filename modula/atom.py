@@ -158,9 +158,16 @@ def _spectral_weight_decay(M, key, spectral_wd=0.1):
 
 
 def _spectral_normalize(M, key):
-    """Normalize the singular values of M to 1."""
-    u, sigma_max, v = _power_iterate(M, key)
-    return M / jnp.maximum(1, sigma_max)
+    """Normalize the largest singular value of M to 1.
+
+    Computes sigma_max via CPU power iteration to avoid GPU memory pressure,
+    then applies a cheap scale on the original device.
+    """
+    cpu = jax.devices("cpu")[0]
+    with jax.default_device(cpu):
+        sigma_max = _spectral_norm_estimate(jax.device_put(M.astype(jnp.float32), cpu))
+    denom = jnp.maximum(1.0, sigma_max).astype(M.dtype)
+    return M / denom
 
 
 def soft_cap_coupling(w_max, wd, max_update_norm):

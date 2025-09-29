@@ -204,18 +204,15 @@ class Rope(Bond):
         self.inverse_frequencies = 1 / base ** (
             jnp.arange(self.rope_dim) / self.rope_dim
         )
-        self.seq_len_cached = None
-        self.sin_cached = None
-        self.cos_cached = None
+        # Do not cache JAX arrays on the object; storing tracers breaks under JIT.
+        # Compute sin/cos on the fly based on seq_len (cheap for typical lengths).
 
-    def get_cached(self, seq_len):
-        if self.seq_len_cached != seq_len:
-            self.seq_len_cached = seq_len
-            distance = jnp.arange(seq_len)
-            freqs = jnp.outer(distance, self.inverse_frequencies)
-            self.cos_cached = jnp.expand_dims(jnp.cos(freqs), (0, 1))
-            self.sin_cached = jnp.expand_dims(jnp.sin(freqs), (0, 1))
-        return self.sin_cached, self.cos_cached
+    def _sin_cos(self, seq_len):
+        distance = jnp.arange(seq_len)
+        freqs = jnp.outer(distance, self.inverse_frequencies)
+        cos = jnp.expand_dims(jnp.cos(freqs), (0, 1))
+        sin = jnp.expand_dims(jnp.sin(freqs), (0, 1))
+        return sin, cos
 
     def rotate(self, x):
         batch, n_heads, seq_len, d_head = x.shape
@@ -224,7 +221,7 @@ class Rope(Bond):
         x1 = x[..., self.rope_dim :]
         x2 = x[..., : self.rope_dim]
 
-        cos, sin = self.get_cached(seq_len)
+        sin, cos = self._sin_cos(seq_len)
         y1 = cos * x1 + sin * x2
         y2 = -sin * x1 + cos * x2
 

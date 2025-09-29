@@ -225,7 +225,7 @@ class Rope(Bond):
         y1 = cos * x1 + sin * x2
         y2 = -sin * x1 + cos * x2
 
-        return jnp.concat([y1, y2], axis=-1)
+        return jnp.concatenate([y1, y2], axis=-1)
 
     def forward(self, x, w):
         q, k = x

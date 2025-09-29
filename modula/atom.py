@@ -301,7 +301,10 @@ class Linear(Atom):
 
         if "spectral_norm" not in self.log_info:
             self.log_info["spectral_norm"] = []
-        self.log_info["spectral_norm"].append(jnp.linalg.svd(w[0], compute_uv=False)[0])
+        # Casting to float32 to avoid unsupported BF16 SVD on GPU
+        self.log_info["spectral_norm"].append(
+            jnp.linalg.svd(w[0].astype(jnp.float32), compute_uv=False)[0]
+        )
         return {self.tracker: self.log_info}
 
 

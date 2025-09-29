@@ -415,6 +415,56 @@ def run_auto_pipeline(args, out_dir: Path):
         key = (meta["optimizer"], meta["spectral"])
         grouped.setdefault(key, []).append((meta, res))
 
+    # If all candidates are extreme (always/no clipping), adaptively expand/shrink delta
+    auto_delta_tasks: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    for opt in optimizers:
+        for spec in spectral_opts:
+            key = (opt, spec)
+            items = grouped.get(key, [])
+            if not items:
+                continue
+            ars = [r.get("accept_rate") for m,r in items if r.get("accept_rate") is not None]
+            if not ars:
+                continue
+            all_zero = all((a is not None and a <= 1e-6) for a in ars)
+            all_one = all((a is not None and abs(a-1.0) < 1e-6) for a in ars)
+            if not (all_zero or all_one):
+                continue
+            # choose an aggregate that did best so far
+            best_meta, best_res = min(items, key=lambda mr: mr[1]["val_loss"])
+            agg = best_meta.get("aggregate") or args.ebc_aggregate
+            spec_bool = (spec == "spec")
+            lr = best_lr.get(key, (None, {"lr": args.lr}))[1]["lr"]
+            # seed delta from max or min candidate
+            d_min = min(delta_candidates)
+            d_max = max(delta_candidates)
+            expand = float(args.auto_delta_expand)
+            iters = int(args.auto_delta_iters)
+            cur = d_max if all_zero else d_min
+            for i in range(iters):
+                if all_zero:
+                    cur *= expand
+                    if cur > args.auto_delta_max:
+                        break
+                else:  # all_one
+                    cur /= expand
+                    if cur < args.auto_delta_min:
+                        break
+                meta = {"stage": "adelta", "optimizer": opt, "spectral": spec, "ebc": "on", "delta": cur, "aggregate": agg, "lr": lr}
+                label = f"adelta_{job_label(meta)}"
+                cfg = make_config(clone_args(warm_args, lr=lr), opt, ebc=True, spectral=spec_bool, delta=cur, aggregate=agg, run_dir=out_dir, job_id=label)
+                auto_delta_tasks.append((meta, cfg))
+
+    if auto_delta_tasks:
+        print("[auto] Adaptive delta attempts:")
+        adelta_results = launch_queue(auto_delta_tasks)
+        for meta,res in adelta_results:
+            print(f"  {(meta['optimizer'], meta['spectral'])} delta={meta['delta']} {meta['aggregate']} lr={meta['lr']}: val={res['val_loss']:.4f} acc_rate={res.get('accept_rate')} avg_c={res.get('avg_c')}")
+        # merge into grouped
+        for meta, res in adelta_results:
+            key = (meta["optimizer"], meta["spectral"])
+            grouped.setdefault(key, []).append((meta, res))
+
     for key, items in grouped.items():
         base_val = baseline_val.get(key, float("inf"))
         band = []
@@ -691,6 +741,11 @@ def main():
     p.add_argument("--accept_hi", type=float, default=0.7)
     p.add_argument("--max_val_degrade", type=float, default=0.02, help="Max allowed relative val loss degrade vs baseline at warmup (e.g., 0.02 = 2%)")
     p.add_argument("--scale_max_val_degrade", type=float, default=0.03, help="Max allowed relative warmup val loss degrade vs baseline when scaling LR under EBC")
+    # Adaptive delta search knobs
+    p.add_argument("--auto_delta_min", type=float, default=0.01, help="Lower bound for adaptive delta search")
+    p.add_argument("--auto_delta_max", type=float, default=8.0, help="Upper bound for adaptive delta search")
+    p.add_argument("--auto_delta_expand", type=float, default=2.0, help="Multiplicative factor when expanding/shrinking delta adaptively")
+    p.add_argument("--auto_delta_iters", type=int, default=3, help="Max additional attempts per base to adaptively search delta")
     p.add_argument("--final_steps", type=int, default=None, help="Override final training steps for winners (defaults to --steps)")
     p.add_argument("--num_gpus", type=int, default=1, help="For --auto: concurrent tasks pinned one per GPU using CUDA_VISIBLE_DEVICES 0..N-1")
     # Checkpointing / resume

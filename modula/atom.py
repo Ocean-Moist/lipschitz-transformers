@@ -4,6 +4,28 @@ import jax.numpy as jnp
 from modula.abstract import Atom
 
 
+def _spectral_norm_estimate(A, num_iters=8):
+    """Cheap power-iteration estimate of the largest singular value.
+
+    Avoids GPU SVD/cuSolver. Uses only matvecs and vector norms.
+    """
+    A = A.astype(jnp.float32)
+    m, n = A.shape
+    v = jnp.ones((n,), dtype=jnp.float32)
+    v = v / (jnp.linalg.norm(v) + 1e-12)
+
+    def body(v, _):
+        Av = A @ v
+        v_new = A.T @ Av
+        v_new = v_new / (jnp.linalg.norm(v_new) + 1e-12)
+        return v_new, None
+
+    v, _ = jax.lax.scan(body, v, None, length=num_iters)
+    Av = A @ v
+    sigma = jnp.linalg.norm(Av)
+    return sigma
+
+
 def batch_project(M, project_fn):
     """Batch project tensors of shape [..., fanout, fanin]."""
     matrix_shape = M.shape[-2:]
@@ -290,21 +312,19 @@ class Linear(Atom):
             self.log_info["weight_norm"] = []
         fan_out, fan_in = w[0].shape
         self.log_info["weight_norm"].append(
-            (fan_in / fan_out) ** 0.5 * jnp.linalg.norm(w[0].astype(jnp.float32), ord=2)
+            (fan_in / fan_out) ** 0.5 * _spectral_norm_estimate(w[0])
         )
 
         if "raw_grad_norm" not in self.log_info:
             self.log_info["raw_grad_norm"] = []
         self.log_info["raw_grad_norm"].append(
-            jnp.linalg.norm(grad_w[0].astype(jnp.float32), ord=2)
+            jnp.linalg.norm(grad_w[0].astype(jnp.float32))  # Frobenius
         )
 
         if "spectral_norm" not in self.log_info:
             self.log_info["spectral_norm"] = []
         # Casting to float32 to avoid unsupported BF16 SVD on GPU
-        self.log_info["spectral_norm"].append(
-            jnp.linalg.svd(w[0].astype(jnp.float32), compute_uv=False)[0]
-        )
+        self.log_info["spectral_norm"].append(_spectral_norm_estimate(w[0]))
         return {self.tracker: self.log_info}
 
 

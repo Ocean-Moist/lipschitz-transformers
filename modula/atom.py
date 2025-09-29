@@ -142,10 +142,19 @@ def _spectral_normalize(M, key):
 
 
 def soft_cap_coupling(w_max, wd, max_update_norm):
-    """Calculates the strength for soft cap that bounds singular values at w_max."""
+    """Calculates the strength for soft cap that bounds singular values at w_max.
+
+    Notes:
+    - jnp.roots uses a nonsymmetric eigendecomposition internally, which JAX only
+      implements on the CPU backend. Force the polynomial root solve onto CPU so
+      training on GPU doesn't crash.
+    """
     k = w_max * (1 - wd) + max_update_norm
     coeffs = jnp.array([-(k**9), 3 * k**7, -3 * k**5, 0, k - w_max])
-    roots = jnp.roots(coeffs, strip_zeros=False)
+    # Always compute roots on CPU to avoid GPU NotImplementedError
+    cpu = jax.devices("cpu")[0]
+    with jax.default_device(cpu):
+        roots = jnp.roots(jax.device_put(coeffs, cpu), strip_zeros=False)
     is_real = jnp.abs(roots.imag) < 1e-6
     is_nonnegative = roots.real >= 0
     padded_reals = jnp.where(

@@ -70,12 +70,27 @@ class AblationLogger:
         }
 
 
-def make_config(args, optimizer: str, ebc: bool, spectral: bool, delta: float = None, aggregate: str = None):
+def make_config(
+    args,
+    optimizer: str,
+    ebc: bool,
+    spectral: bool,
+    delta: float = None,
+    aggregate: str = None,
+    run_dir: Optional[Path] = None,
+    job_id: Optional[str] = None,
+):
     # Project mapping
     if spectral:
         project = {"default": "spec_normalize"}
     else:
         project = {"default": "none"}
+
+    # Resolve run directory for artifacts/checkpoints
+    out_root = Path(run_dir) if run_dir is not None else Path(args.output_dir)
+    ckpt_dir = out_root / "ckpts"
+    if job_id:
+        ckpt_dir = ckpt_dir / job_id
 
     cfg = dict(
         # Data/model
@@ -127,7 +142,11 @@ def make_config(args, optimizer: str, ebc: bool, spectral: bool, delta: float = 
         ebc_include_embed_out=False,
         # Misc
         jit=bool(args.jit),  # enable with --jit; default False due to RoPE tracer note
-        output_dir=str(args.output_dir),
+        output_dir=str(out_root),
+        # Checkpoint/resume
+        resume=bool(getattr(args, "resume", True)),
+        ckpt_interval=int(getattr(args, "ckpt_interval", 200)),
+        ckpt_dir=str(ckpt_dir),
     )
     return cfg
 
@@ -144,7 +163,32 @@ def run_one(config_dict: Dict[str, Any]):
     params = model.initialize(sub)
     opt_state = optimizer.init_state(params)
 
+    # Resume support: load latest checkpoint if present
+    ckpt_dir = Path(getattr(config, "ckpt_dir", Path(config.output_dir) / "ckpts"))
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    done_path = ckpt_dir / "done.json"
+    if getattr(config, "resume", True) and done_path.exists():
+        with open(done_path, "r") as f:
+            saved = json.load(f)
+        return saved
+
+    latest_ckpt = None
+    if getattr(config, "resume", True):
+        for p in sorted(ckpt_dir.glob("ckpt_*.pkl")):
+            latest_ckpt = p
+        if latest_ckpt is not None:
+            import pickle
+            with open(latest_ckpt, "rb") as f:
+                state = pickle.load(f)
+            # Restore trainer-related counters after instantiation below
+            params = state.get("params", params)
+            opt_state = state.get("opt_state", opt_state)
+            key = state.get("key", key)
+
     trainer = Trainer(model, optimizer, train_loader, val_loader, loss_fn, config, logger)
+    # If we loaded a checkpoint, restore trainer internals and step
+    if getattr(config, "resume", True) and latest_ckpt is not None:
+        trainer.restore_state(state)
 
     t0 = time.time()
     params, opt_state, key = trainer.train(params, opt_state, key)
@@ -163,7 +207,7 @@ def run_one(config_dict: Dict[str, Any]):
         accept_rate = float(sum(1 for c in cs if c >= 0.999) / len(cs))
         avg_c = float(sum(cs) / len(cs))
 
-    return {
+    result = {
         "wall_clock": wall_clock,
         "val_loss": float(val_metrics["loss"]),
         "val_acc": float(val_metrics["accuracy"]),
@@ -172,6 +216,13 @@ def run_one(config_dict: Dict[str, Any]):
         "accept_rate": accept_rate,
         "avg_c": avg_c,
     }
+    # Mark job as done for resume detection
+    try:
+        with open(done_path, "w") as f:
+            json.dump(result, f)
+    except Exception:
+        pass
+    return result
 
 
 def plot_run(history: Dict[str, Any], file_prefix: str, out_dir: Path, display_title: Optional[str] = None):
@@ -242,6 +293,25 @@ def run_auto_pipeline(args, out_dir: Path):
     delta_candidates = [float(x) for x in args.ebc_deltas_auto.split(",") if x]
     agg_candidates = [s.strip() for s in args.ebc_aggregates_auto.split(",") if s.strip()]
 
+    # Detect available GPUs and clamp concurrency
+    try:
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if visible is not None and visible.strip() != "":
+            gpu_list = [x for x in visible.split(",") if x.strip() != ""]
+            avail_gpus = len(gpu_list)
+        else:
+            # JAX will raise if no plugin; handle defensively
+            avail_gpus = len([d for d in jax.devices() if d.platform == "gpu"])
+    except Exception:
+        avail_gpus = 0
+    if avail_gpus <= 0:
+        print("[auto] Warning: no GPUs detected; falling back to CPU. This will be very slow.")
+        effective_gpus = 0
+    else:
+        effective_gpus = min(int(args.num_gpus), avail_gpus)
+        if effective_gpus < int(args.num_gpus):
+            print(f"[auto] Requested num_gpus={args.num_gpus} but only {avail_gpus} visible; using {effective_gpus}.")
+
     warm_args = clone_args(
         args,
         steps=int(args.auto_warmup_steps),
@@ -257,7 +327,7 @@ def run_auto_pipeline(args, out_dir: Path):
     # Queue helpers
     def launch_queue(task_list: List[Tuple[Dict[str, Any], Dict[str, Any]]]) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
         # Use multi-GPU orchestration if requested; else run inline sequentially
-        if args.num_gpus <= 1:
+        if effective_gpus <= 1:
             results: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
             for t in task_list:
                 results.append(_run_task(t))
@@ -269,7 +339,7 @@ def run_auto_pipeline(args, out_dir: Path):
         results: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
         next_task_idx = 0
         # Pre-fill
-        for gid in range(min(args.num_gpus, len(task_list))):
+        for gid in range(min(effective_gpus, len(task_list))):
             proc = _launch_single_task_subprocess(task_list[next_task_idx], gid, tmp_dir)
             active.append(proc)
             next_task_idx += 1
@@ -294,7 +364,8 @@ def run_auto_pipeline(args, out_dir: Path):
             spec_bool = (spec == "spec")
             for lr in lr_bracket.get(opt, [args.lr]):
                 meta = {"stage": "lr", "optimizer": opt, "spectral": spec, "ebc": "off", "delta": None, "aggregate": None, "lr": lr}
-                cfg = make_config(clone_args(warm_args, lr=lr), opt, ebc=False, spectral=spec_bool)
+                label = f"lr_{job_label(meta)}_lr{str(lr).replace('.', 'p')}"
+                cfg = make_config(clone_args(warm_args, lr=lr), opt, ebc=False, spectral=spec_bool, run_dir=out_dir, job_id=label)
                 lr_tasks.append((meta, cfg))
 
     lr_results = launch_queue(lr_tasks)
@@ -321,7 +392,8 @@ def run_auto_pipeline(args, out_dir: Path):
             for delta in delta_candidates:
                 for agg in agg_candidates:
                     meta = {"stage": "calib", "optimizer": opt, "spectral": spec, "ebc": "on", "delta": delta, "aggregate": agg, "lr": lr}
-                    cfg = make_config(clone_args(warm_args, lr=lr), opt, ebc=True, spectral=spec_bool, delta=delta, aggregate=agg)
+                    label = f"calib_{job_label(meta)}"
+                    cfg = make_config(clone_args(warm_args, lr=lr), opt, ebc=True, spectral=spec_bool, delta=delta, aggregate=agg, run_dir=out_dir, job_id=label)
                     ebc_tasks.append((meta, cfg))
 
     ebc_results = launch_queue(ebc_tasks)
@@ -374,13 +446,15 @@ def run_auto_pipeline(args, out_dir: Path):
             lr = best_lr[key][1]["lr"] if key in best_lr else args.lr
             # baseline
             base_meta = {"stage": "final", "optimizer": opt, "spectral": spec, "ebc": "off", "delta": None, "aggregate": None, "lr": lr}
-            base_cfg = make_config(clone_args(final_args, lr=lr), opt, ebc=False, spectral=spec_bool)
+            base_label = f"final_{job_label(base_meta)}"
+            base_cfg = make_config(clone_args(final_args, lr=lr), opt, ebc=False, spectral=spec_bool, run_dir=out_dir, job_id=base_label)
             final_tasks.append((base_meta, base_cfg))
             # ebc winner
             if winners.get(key):
                 m = winners[key]
                 ebc_meta = {"stage": "final", "optimizer": opt, "spectral": spec, "ebc": "on", "delta": m["delta"], "aggregate": m["aggregate"], "lr": lr}
-                ebc_cfg = make_config(clone_args(final_args, lr=lr), opt, ebc=True, spectral=spec_bool, delta=m["delta"], aggregate=m["aggregate"])
+                ebc_label = f"final_{job_label(ebc_meta)}"
+                ebc_cfg = make_config(clone_args(final_args, lr=lr), opt, ebc=True, spectral=spec_bool, delta=m["delta"], aggregate=m["aggregate"], run_dir=out_dir, job_id=ebc_label)
                 final_tasks.append((ebc_meta, ebc_cfg))
 
     final_results = launch_queue(final_tasks)
@@ -453,7 +527,14 @@ def _launch_single_task_subprocess(task: Tuple[Dict[str, Any], Dict[str, Any]], 
 
     env = os.environ.copy()
     env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    # Respect parent's CUDA_VISIBLE_DEVICES mapping if present (may be UUIDs or a subset of indices)
+    parent_visible = env.get("CUDA_VISIBLE_DEVICES")
+    if parent_visible and parent_visible.strip() != "":
+        ids = [s.strip() for s in parent_visible.split(",") if s.strip()]
+        chosen = ids[gpu_id % len(ids)]
+        env["CUDA_VISIBLE_DEVICES"] = chosen
+    else:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     cmd = [python_exe, "-m", "scripts.run_shakespeare_ebc_ablation", "--single_task", str(in_path), "--single_task_out", str(out_path)]
     proc = subprocess.Popen(cmd, env=env)
     return proc, out_path, meta, gpu_id
@@ -478,6 +559,7 @@ def _drain_finished(procs: List[Tuple[subprocess.Popen, Path, Dict[str, Any], in
 def main():
     p = argparse.ArgumentParser(description="Shakespeare EBC ablation")
     p.add_argument("--output_dir", type=Path, default=Path("outputs/ebc_ablation"))
+    p.add_argument("--run_dir", type=Path, default=None, help="Optional: reuse an existing run directory to resume an interrupted sweep")
     # Model/data
     p.add_argument("--vocab_size", type=int, default=65)
     p.add_argument("--num_heads", type=int, default=4)
@@ -528,6 +610,9 @@ def main():
     p.add_argument("--max_val_degrade", type=float, default=0.02, help="Max allowed relative val loss degrade vs baseline at warmup (e.g., 0.02 = 2%)")
     p.add_argument("--final_steps", type=int, default=None, help="Override final training steps for winners (defaults to --steps)")
     p.add_argument("--num_gpus", type=int, default=1, help="For --auto: concurrent tasks pinned one per GPU using CUDA_VISIBLE_DEVICES 0..N-1")
+    # Checkpointing / resume
+    p.add_argument("--resume", action="store_true", default=True, help="Resume from checkpoints if present (default on)")
+    p.add_argument("--ckpt_interval", type=int, default=200, help="Save a checkpoint every N optimizer steps")
     # Single-task worker mode (internal)
     p.add_argument("--single_task", type=Path, default=None)
     p.add_argument("--single_task_out", type=Path, default=None)
@@ -545,8 +630,11 @@ def main():
             _write_json(args.single_task_out, res)
         return
 
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    out_dir = args.output_dir / timestamp
+    if args.run_dir is not None:
+        out_dir = args.run_dir
+    else:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        out_dir = args.output_dir / timestamp
     out_dir.mkdir(parents=True, exist_ok=True)
 
     optimizers = [s.strip() for s in args.optimizers.split(",") if s.strip()]
@@ -559,7 +647,7 @@ def main():
     print("optimizer,spectral,ebc,delta,aggregate,wall_clock,val_loss,val_acc,ppl,accept_rate,avg_c")
 
     # Warm dataset once (avoids parallel download race producing empty memmaps)
-    warm_cfg_dict = make_config(args, optimizers[0], ebc=False, spectral=False)
+    warm_cfg_dict = make_config(args, optimizers[0], ebc=False, spectral=False, run_dir=out_dir, job_id="_warm")
     warm_config = parse_config_from_json(warm_cfg_dict)
     _warm_train, _warm_val, _ = get_data_loader(warm_config)
     del _warm_train
@@ -570,7 +658,8 @@ def main():
         for spec in spectral_opts:
             spec_bool = spec == "spec"
             meta = {"optimizer": opt, "spectral": spec, "ebc": "off", "delta": None, "aggregate": None}
-            cfg = make_config(args, opt, ebc=False, spectral=spec_bool)
+            label = job_label(meta)
+            cfg = make_config(args, opt, ebc=False, spectral=spec_bool, run_dir=out_dir, job_id=label)
             tasks.append((meta, cfg))
 
             if "on" in ebc_opts:
@@ -583,7 +672,8 @@ def main():
                             "delta": delta,
                             "aggregate": agg,
                         }
-                        cfg = make_config(args, opt, ebc=True, spectral=spec_bool, delta=delta, aggregate=agg)
+                        label = job_label(meta)
+                        cfg = make_config(args, opt, ebc=True, spectral=spec_bool, delta=delta, aggregate=agg, run_dir=out_dir, job_id=label)
                         tasks.append((meta, cfg))
 
     def handle_result(meta: Dict[str, Any], res: Dict[str, Any]):

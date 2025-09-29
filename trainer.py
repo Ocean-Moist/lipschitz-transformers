@@ -1,4 +1,8 @@
 import time
+import os
+import pickle
+from pathlib import Path
+import numpy as np
 import jax
 import jax.numpy as jnp
 from functools import partial
@@ -36,6 +40,48 @@ class Trainer:
         self._ebc_scope_idx = None  # indices of layers in budget
         self._ebc_probe_pos = 0  # round-robin pointer
         self._ebc_last = None  # last (tau,S,c)
+
+    def _ckpt_paths(self):
+        ckdir = Path(getattr(self.config, "ckpt_dir", Path(self.config.output_dir) / "ckpts"))
+        ckdir.mkdir(parents=True, exist_ok=True)
+        latest = ckdir / "latest.pkl"
+        return ckdir, latest
+
+    def _save_checkpoint(self, params, opt_state, key):
+        ckdir, latest = self._ckpt_paths()
+        state = {
+            "step": int(self.step),
+            "params": jax.device_get(params),
+            "opt_state": jax.device_get(opt_state),
+            "key": jax.device_get(key),
+            "ebc": {
+                "probe_inputs": None if self._ebc_probe_inputs is None else jax.device_get(self._ebc_probe_inputs),
+                "betas": self._ebc_betas,
+                "scope_idx": self._ebc_scope_idx,
+                "probe_pos": self._ebc_probe_pos,
+                "last": self._ebc_last,
+            },
+        }
+        tmp = ckdir / f"ckpt_{self.step:06d}.pkl"
+        with open(tmp, "wb") as f:
+            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+        # Update latest pointer
+        try:
+            with open(latest, "wb") as f:
+                pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception:
+            pass
+
+    def restore_state(self, state):
+        # Restore trainer internals and return params/opt_state/key
+        self.step = int(state.get("step", 0))
+        e = state.get("ebc", {}) or {}
+        self._ebc_probe_inputs = e.get("probe_inputs", None)
+        self._ebc_betas = e.get("betas", None)
+        self._ebc_scope_idx = e.get("scope_idx", None)
+        self._ebc_probe_pos = int(e.get("probe_pos", 0))
+        self._ebc_last = e.get("last", None)
+        return state.get("params"), state.get("opt_state"), state.get("key")
 
     def train(self, params, opt_state, key):
         """Run one training epoch."""
@@ -170,10 +216,17 @@ class Trainer:
                 val_metrics = self.validate(params)
                 self.logger.log_validation(self.step, val_metrics)
 
+            # Checkpoint periodically
+            if getattr(self.config, "ckpt_interval", 0) and (self.step % int(self.config.ckpt_interval) == 0):
+                self._save_checkpoint(params, opt_state, key)
+
             # Check if training complete
             if self.step >= self.config.steps:
                 break
 
+        # Final checkpoint
+        if getattr(self.config, "ckpt_interval", 0):
+            self._save_checkpoint(params, opt_state, key)
         return params, opt_state, key
 
     def validate(self, params):

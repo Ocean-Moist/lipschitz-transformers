@@ -292,6 +292,7 @@ def run_auto_pipeline(args, out_dir: Path):
     lr_bracket = {"adam": adam_lrs, "muon": muon_lrs}
     delta_candidates = [float(x) for x in args.ebc_deltas_auto.split(",") if x]
     agg_candidates = [s.strip() for s in args.ebc_aggregates_auto.split(",") if s.strip()]
+    lr_scales = [float(x) for x in args.ebc_lr_scales.split(",") if x]
 
     # Detect available GPUs and clamp concurrency
     try:
@@ -435,6 +436,75 @@ def run_auto_pipeline(args, out_dir: Path):
                 pick = best_any[1]
         winners[key] = pick
 
+    # Stage 2b: LR-scale sweep for EBC + control baselines
+    scale_tasks: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    scale_ctrl_tasks: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    for opt in optimizers:
+        for spec in spectral_opts:
+            key = (opt, spec)
+            winner = winners.get(key)
+            if not winner:
+                continue
+            spec_bool = (spec == "spec")
+            lr0 = best_lr[key][1]["lr"] if key in best_lr else args.lr
+            for s in lr_scales:
+                lr_s = lr0 * s
+                # EBC scaled task
+                meta_e = {"stage": "scale", "optimizer": opt, "spectral": spec, "ebc": "on", "delta": winner["delta"], "aggregate": winner["aggregate"], "lr": lr_s, "lr_scale": s}
+                label_e = f"scale_{job_label(meta_e)}_x{str(s).replace('.','p')}"
+                cfg_e = make_config(clone_args(warm_args, lr=lr_s), opt, ebc=True, spectral=spec_bool, delta=winner["delta"], aggregate=winner["aggregate"], run_dir=out_dir, job_id=label_e)
+                scale_tasks.append((meta_e, cfg_e))
+                # Control baseline at scaled LR
+                meta_c = {"stage": "scale_ctrl", "optimizer": opt, "spectral": spec, "ebc": "off", "delta": None, "aggregate": None, "lr": lr_s, "lr_scale": s}
+                label_c = f"scale_ctrl_{job_label(meta_c)}_x{str(s).replace('.','p')}"
+                cfg_c = make_config(clone_args(warm_args, lr=lr_s), opt, ebc=False, spectral=spec_bool, run_dir=out_dir, job_id=label_c)
+                scale_ctrl_tasks.append((meta_c, cfg_c))
+
+    scale_results: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    scale_ctrl_results: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    if scale_tasks:
+        scale_results = launch_queue(scale_tasks)
+    if scale_ctrl_tasks:
+        scale_ctrl_results = launch_queue(scale_ctrl_tasks)
+
+    # Choose best LR scale per base
+    scale_grouped: Dict[Tuple[str, str], List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
+    ctrl_grouped: Dict[Tuple[str, str], List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
+    for meta, res in scale_results:
+        key = (meta["optimizer"], meta["spectral"])
+        scale_grouped.setdefault(key, []).append((meta, res))
+    for meta, res in scale_ctrl_results:
+        key = (meta["optimizer"], meta["spectral"])
+        ctrl_grouped.setdefault(key, []).append((meta, res))
+
+    chosen_scale: Dict[Tuple[str, str], Optional[float]] = {k: None for k in winners}
+    scale_notes: Dict[str, Any] = {}
+    for key, items in scale_grouped.items():
+        if not winners.get(key):
+            continue
+        base_val = baseline_val.get(key, float("inf"))
+        viable = []
+        for meta, res in items:
+            s = float(meta.get("lr_scale", 1.0))
+            ar = res.get("accept_rate")
+            v = res["val_loss"]
+            if (ar is not None and args.accept_lo <= ar <= args.accept_hi) and (v <= base_val * (1 + args.scale_max_val_degrade)):
+                viable.append((s, v, meta, res))
+        if viable:
+            viable.sort(key=lambda x: (x[0], -x[1]))
+            s_pick, v_pick, m_pick, r_pick = viable[-1]
+            chosen_scale[key] = s_pick
+            scale_notes["|".join(key)] = {"lr_scale": s_pick, "val_loss": v_pick, "accept_rate": r_pick.get("accept_rate")}
+        else:
+            # fallback to best v across scales if within cap
+            items_sorted = sorted(items, key=lambda mr: mr[1]["val_loss"])
+            if items_sorted and items_sorted[0][1]["val_loss"] <= base_val * (1 + args.scale_max_val_degrade):
+                s_pick = float(items_sorted[0][0].get("lr_scale", 1.0))
+                chosen_scale[key] = s_pick
+                scale_notes["|".join(key)] = {"lr_scale": s_pick, "val_loss": items_sorted[0][1]["val_loss"], "accept_rate": items_sorted[0][1].get("accept_rate")}
+            else:
+                scale_notes["|".join(key)] = {"lr_scale": None}
+
     # Stage 3: Final full runs for baseline + winners
     final_steps = int(args.final_steps or args.steps)
     final_args = clone_args(args, steps=final_steps)
@@ -452,10 +522,17 @@ def run_auto_pipeline(args, out_dir: Path):
             # ebc winner
             if winners.get(key):
                 m = winners[key]
-                ebc_meta = {"stage": "final", "optimizer": opt, "spectral": spec, "ebc": "on", "delta": m["delta"], "aggregate": m["aggregate"], "lr": lr}
+                s = chosen_scale.get(key)
+                lr_e = lr * (s if s is not None else 1.0)
+                ebc_meta = {"stage": "final", "optimizer": opt, "spectral": spec, "ebc": "on", "delta": m["delta"], "aggregate": m["aggregate"], "lr": lr_e, "lr_scale": (s if s is not None else 1.0)}
                 ebc_label = f"final_{job_label(ebc_meta)}"
-                ebc_cfg = make_config(clone_args(final_args, lr=lr), opt, ebc=True, spectral=spec_bool, delta=m["delta"], aggregate=m["aggregate"], run_dir=out_dir, job_id=ebc_label)
+                ebc_cfg = make_config(clone_args(final_args, lr=lr_e), opt, ebc=True, spectral=spec_bool, delta=m["delta"], aggregate=m["aggregate"], run_dir=out_dir, job_id=ebc_label)
                 final_tasks.append((ebc_meta, ebc_cfg))
+                if s is not None and s != 1.0:
+                    ctrl_meta = {"stage": "final", "optimizer": opt, "spectral": spec, "ebc": "off", "delta": None, "aggregate": None, "lr": lr_e, "lr_scale": s}
+                    ctrl_label = f"final_ctrl_{job_label(ctrl_meta)}"
+                    ctrl_cfg = make_config(clone_args(final_args, lr=lr_e), opt, ebc=False, spectral=spec_bool, run_dir=out_dir, job_id=ctrl_label)
+                    final_tasks.append((ctrl_meta, ctrl_cfg))
 
     final_results = launch_queue(final_tasks)
 
@@ -491,12 +568,16 @@ def run_auto_pipeline(args, out_dir: Path):
     decisions = {
         "best_lr": {"|".join(k): v[1]["lr"] for k, v in best_lr.items()},
         "winners": {"|".join(k): winners[k] for k in winners},
+        "chosen_scale": {"|".join(k): chosen_scale.get(k) for k in chosen_scale} if 'chosen_scale' in locals() else {},
         "settings": {
             "accept_band": [args.accept_lo, args.accept_hi],
             "max_val_degrade": args.max_val_degrade,
+            "scale_max_val_degrade": getattr(args, 'scale_max_val_degrade', None),
             "warmup_steps": args.auto_warmup_steps,
             "final_steps": final_steps,
+            "ebc_lr_scales": lr_scales,
         },
+        "scale_notes": locals().get('scale_notes', {}),
     }
     with open(out_dir / "auto_decisions.json", "w") as f:
         json.dump(decisions, f, indent=2)
@@ -605,9 +686,11 @@ def main():
     p.add_argument("--muon_lrs", type=str, default="3e-3,1e-2,2e-2")
     p.add_argument("--ebc_deltas_auto", type=str, default="0.5,1.0,2.0")
     p.add_argument("--ebc_aggregates_auto", type=str, default="l2,l1")
+    p.add_argument("--ebc_lr_scales", type=str, default="1,1.5,2,3", help="LR multipliers to test for EBC headroom after delta selection")
     p.add_argument("--accept_lo", type=float, default=0.1)
     p.add_argument("--accept_hi", type=float, default=0.7)
     p.add_argument("--max_val_degrade", type=float, default=0.02, help="Max allowed relative val loss degrade vs baseline at warmup (e.g., 0.02 = 2%)")
+    p.add_argument("--scale_max_val_degrade", type=float, default=0.03, help="Max allowed relative warmup val loss degrade vs baseline when scaling LR under EBC")
     p.add_argument("--final_steps", type=int, default=None, help="Override final training steps for winners (defaults to --steps)")
     p.add_argument("--num_gpus", type=int, default=1, help="For --auto: concurrent tasks pinned one per GPU using CUDA_VISIBLE_DEVICES 0..N-1")
     # Checkpointing / resume

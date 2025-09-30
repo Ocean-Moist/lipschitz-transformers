@@ -26,6 +26,20 @@ def _spectral_norm_estimate(A, num_iters=8):
     return sigma
 
 
+def _to_device(array, like):
+    """Utility: place `array` on the same device as `like` when possible."""
+    try:
+        target = like.devices()[0]
+    except (AttributeError, IndexError):
+        try:
+            target = like.device()
+        except AttributeError:
+            target = None
+    if target is None:
+        return array
+    return jax.device_put(array, target)
+
+
 def batch_project(M, project_fn):
     """Batch project tensors of shape [..., fanout, fanin]."""
     matrix_shape = M.shape[-2:]
@@ -157,15 +171,40 @@ def _spectral_weight_decay(M, key, spectral_wd=0.1):
     return M - change * outer
 
 
-def _spectral_normalize(M, key):
-    """Normalize the largest singular value of M to 1.
+def _spectral_normalize(M, key, backend="auto"):
+    """Normalize the largest singular value of ``M`` to 1.
 
-    Computes sigma_max via CPU power iteration to avoid GPU memory pressure,
-    then applies a cheap scale on the original device.
+    When ``backend`` is ``gpu`` (or ``auto`` with sufficient headroom) the
+    estimate is computed in-place on the active accelerator via power
+    iteration. A CPU fallback remains available for environments that cannot
+    spare GPU memory or lack the necessary solver support.
     """
-    cpu = jax.devices("cpu")[0]
-    with jax.default_device(cpu):
-        sigma_max = _spectral_norm_estimate(jax.device_put(M.astype(jnp.float32), cpu))
+
+    def _gpu_path():
+        _, sigma_max, _ = _power_iterate(M.astype(jnp.float32), key)
+        return sigma_max
+
+    def _cpu_path():
+        cpu = jax.devices("cpu")[0]
+        with jax.default_device(cpu):
+            sigma = _spectral_norm_estimate(jax.device_put(M.astype(jnp.float32), cpu))
+        return _to_device(sigma, M)
+
+    if backend == "gpu":
+        sigma_max = _gpu_path()
+    elif backend == "cpu":
+        sigma_max = _cpu_path()
+    else:  # auto
+        try:
+            sigma_max = _gpu_path()
+        except RuntimeError as err:
+            # Fall back to CPU on OOM or other device errors
+            message = str(err).lower()
+            if "out of memory" in message or "resource_exhausted" in message:
+                sigma_max = _cpu_path()
+            else:
+                raise
+
     denom = jnp.maximum(1.0, sigma_max).astype(M.dtype)
     return M / denom
 
@@ -217,8 +256,8 @@ def spectral_weight_decay(M, key, spectral_wd=0.1, **kwargs):
     return batch_project(M, lambda x: _spectral_weight_decay(x, key, spectral_wd))
 
 
-def spectral_normalize(M, key, **kwargs):
-    return batch_project(M, lambda x: _spectral_normalize(x, key))
+def spectral_normalize(M, key, backend="auto", **kwargs):
+    return batch_project(M, lambda x: _spectral_normalize(x, key, backend=backend))
 
 
 # Embed
@@ -250,6 +289,7 @@ class Linear(Atom):
         project=None,
         sensitive_to_wmax=None,
         tracker=None,
+        spectral_backend="auto",
     ):
         super().__init__(tracker)
         self.fanin = fanin
@@ -260,6 +300,7 @@ class Linear(Atom):
         self.smooth = True
         self.mass = 1
         self.sensitivity = 1
+        self.spectral_backend = spectral_backend
 
         self._project = lambda x, **kwargs: x
         self.sensitive_to_wmax = (
@@ -303,7 +344,12 @@ class Linear(Atom):
         if self.sensitive_to_wmax:
             scale *= w_max
         projected = scale * self._project(
-            casted / scale, spectral_wd=spectral_wd, alpha=alpha, w_max=w_max, key=key
+            casted / scale,
+            spectral_wd=spectral_wd,
+            alpha=alpha,
+            w_max=w_max,
+            key=key,
+            backend=self.spectral_backend,
         )
         return [projected.astype(self.dtype)]
 

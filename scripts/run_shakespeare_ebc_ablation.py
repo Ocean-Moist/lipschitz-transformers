@@ -70,6 +70,16 @@ class AblationLogger:
         }
 
 
+class TaskFailed(RuntimeError):
+    def __init__(self, meta: Dict[str, Any], returncode: int, log_path: Path, task: Tuple[Dict[str, Any], Dict[str, Any]]):
+        message = f"Subprocess failed for {meta} with return code {returncode}"
+        super().__init__(message)
+        self.meta = meta
+        self.returncode = returncode
+        self.log_path = log_path
+        self.task = task
+
+
 def make_config(
     args,
     optimizer: str,
@@ -143,6 +153,7 @@ def make_config(
         # Misc
         jit=bool(args.jit),  # enable with --jit; default False due to RoPE tracer note
         output_dir=str(out_root),
+        spectral_backend=getattr(args, "spectral_backend", "auto"),
         # Checkpoint/resume
         resume=bool(getattr(args, "resume", True)),
         ckpt_interval=int(getattr(args, "ckpt_interval", 200)),
@@ -199,12 +210,14 @@ def run_one(config_dict: Dict[str, Any]):
     ppl = float(math.exp(float(val_metrics["loss"])) if val_metrics["loss"] < 20 else float("inf"))
 
     history = logger.get_results()
-    # Accept rate / avg clip
+    # Clip statistics
     cs = [c for c in history["ebc_c"] if c is not None]
-    accept_rate = None
+    no_clip_rate = None
+    clip_rate = None
     avg_c = None
     if cs:
-        accept_rate = float(sum(1 for c in cs if c >= 0.999) / len(cs))
+        no_clip_rate = float(sum(1 for c in cs if c >= 0.999) / len(cs))
+        clip_rate = 1.0 - no_clip_rate
         avg_c = float(sum(cs) / len(cs))
 
     result = {
@@ -213,7 +226,9 @@ def run_one(config_dict: Dict[str, Any]):
         "val_acc": float(val_metrics["accuracy"]),
         "ppl": ppl,
         "history": history,
-        "accept_rate": accept_rate,
+        "accept_rate": no_clip_rate,
+        "no_clip_rate": no_clip_rate,
+        "clip_rate": clip_rate,
         "avg_c": avg_c,
     }
     # Mark job as done for resume detection
@@ -281,7 +296,7 @@ def run_auto_pipeline(args, out_dir: Path):
     Strategy:
     - For each base (optimizer x spectral), sweep LR bracket for baseline (EBC off) for warmup steps.
     - Pick LR with lowest warmup val loss per base.
-    - For each base, sweep deltas/aggregates for EBC for warmup steps using the chosen LR; pick candidate with accept_rate in [accept_lo, accept_hi] and best val; fallback to best val not worse than baseline by max_val_degrade; otherwise skip EBC for that base.
+    - For each base, sweep deltas/aggregates for EBC for warmup steps using the chosen LR; pick candidate whose clip rate falls within [accept_lo, accept_hi] (interpreted as clip-rate band) and best val; fallback to best val not worse than baseline by max_val_degrade; otherwise skip EBC for that base.
     - Run final full steps for the baseline and EBC winner per base.
     """
     optimizers = [s.strip() for s in args.optimizers.split(",") if s.strip()]
@@ -336,27 +351,82 @@ def run_auto_pipeline(args, out_dir: Path):
 
         tmp_dir = out_dir / "_auto_tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        active: List[Tuple[subprocess.Popen, Path, Dict[str, Any], int]] = []
+        pending: List[Tuple[Dict[str, Any], Dict[str, Any]]] = list(task_list)
+        active: List[Tuple[subprocess.Popen, Path, Dict[str, Any], int, Tuple[Dict[str, Any], Dict[str, Any]]]] = []
         results: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        retry_counts: Dict[str, int] = {}
+        max_task_retries = max(0, int(getattr(args, "task_retry", 1)))
         next_task_idx = 0
-        # Pre-fill
-        for gid in range(min(effective_gpus, len(task_list))):
-            proc = _launch_single_task_subprocess(task_list[next_task_idx], gid, tmp_dir)
+
+        # Helper to launch the next pending task on a specific GPU id
+        def launch_next(gid: int):
+            nonlocal next_task_idx
+            if next_task_idx >= len(pending):
+                return False
+            task = pending[next_task_idx]
+            proc = _launch_single_task_subprocess(task, gid, tmp_dir)
             active.append(proc)
             next_task_idx += 1
+            return True
 
-        while active:
-            finished = _drain_finished(active)
+        # Initial fill
+        for gid in range(min(effective_gpus, len(pending))):
+            launch_next(gid)
+
+        while active or next_task_idx < len(pending):
+            try:
+                finished = _drain_finished(active)
+            except TaskFailed as err:
+                meta_key = json.dumps(err.meta, sort_keys=True)
+                attempt = retry_counts.get(meta_key, 0)
+                if attempt < max_task_retries:
+                    retry_counts[meta_key] = attempt + 1
+                    pending.append(err.task)
+                    time.sleep(min(2.0 * (attempt + 1), 10.0))
+                    continue
+                raise RuntimeError(f"Subprocess failed for {err.meta} after {attempt} retries (rc={err.returncode})") from err
+
             for meta, res, gid in finished:
                 results.append((meta, res))
-                # launch next
-                if next_task_idx < len(task_list):
-                    proc = _launch_single_task_subprocess(task_list[next_task_idx], gid, tmp_dir)
-                    active.append(proc)
-                    next_task_idx += 1
-            # be gentle
-            time.sleep(0.2)
+                launch_next(gid)
+
+            if active:
+                time.sleep(0.2)
+            elif next_task_idx < len(pending):
+                # If GPUs freed but nothing active, launch pending tasks on available slots
+                for gid in range(min(effective_gpus, len(pending) - next_task_idx)):
+                    launch_next(gid)
+
         return results
+
+    def _clip_value(metrics: Dict[str, Any]) -> float:
+        clip = metrics.get("clip_rate")
+        return 0.0 if clip is None else float(clip)
+
+    def _summarize_entry(meta: Dict[str, Any], metrics: Dict[str, Any]) -> Dict[str, Any]:
+        entry = {
+            "meta": meta,
+            "metrics": metrics,
+            "optimizer": meta.get("optimizer"),
+            "spectral": meta.get("spectral"),
+            "aggregate": meta.get("aggregate"),
+            "delta": float(meta.get("delta")) if meta.get("delta") is not None else None,
+            "lr": float(meta.get("lr")) if meta.get("lr") is not None else None,
+            "stage": meta.get("stage"),
+            "clip_rate": _clip_value(metrics),
+            "avg_c": metrics.get("avg_c"),
+            "val_loss": float(metrics.get("val_loss", float("inf"))),
+        }
+        return entry
+
+    clip_lo = float(args.accept_lo)
+    clip_hi = float(args.accept_hi)
+    clip_target = args.clip_target if args.clip_target is not None else 0.5 * (clip_lo + clip_hi)
+    skip_threshold = getattr(args, "auto_skip_threshold", 0.2)
+    delta_min = float(args.auto_delta_min)
+    delta_max = float(args.auto_delta_max)
+    delta_expand = float(args.auto_delta_expand)
+    delta_iters = int(args.auto_delta_iters)
 
     # Stage 1: LR sweep per base
     lr_tasks: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
@@ -374,140 +444,305 @@ def run_auto_pipeline(args, out_dir: Path):
     # Summarize and pick best LR per base
     best_lr: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
     baseline_val: Dict[Tuple[str, str], float] = {}
+    lr_records: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
     print("[auto] LR sweep results:")
     for meta, res in lr_results:
         key = (meta["optimizer"], meta["spectral"])
         v = res["val_loss"]
+        lr_records.setdefault(key, []).append(_summarize_entry(meta, res))
         if key not in best_lr or v < best_lr[key][0]:
             best_lr[key] = (v, meta)
             baseline_val[key] = v
         print(f"  {key} lr={meta['lr']}: val_loss={v:.4f}")
 
+    global_best_val = min(baseline_val.values()) if baseline_val else float("inf")
+    skip_bases: Dict[Tuple[str, str], bool] = {}
+    for key, val in baseline_val.items():
+        skip = bool(val > global_best_val * (1 + skip_threshold)) if math.isfinite(global_best_val) else False
+        skip_bases[key] = skip
+        if skip:
+            print(
+                f"  -> Skipping calibration for {key} (baseline {val:.4f} vs best {global_best_val:.4f}, threshold {(1 + skip_threshold):.2f}x)"
+            )
+
     # Stage 2: EBC calibration using chosen LR
-    ebc_tasks: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
-    for opt in optimizers:
-        for spec in spectral_opts:
-            spec_bool = (spec == "spec")
-            key = (opt, spec)
-            lr = best_lr[key][1]["lr"] if key in best_lr else args.lr
+
+    def calibrate_base(opt: str, spec: str, base_lr: float, base_val: float):
+        spec_bool = (spec == "spec")
+        entries: List[Dict[str, Any]] = []
+        seen: set[Tuple[str, float]] = set()
+
+        def record(results: List[Tuple[Dict[str, Any], Dict[str, Any]]]):
+            for meta, metrics in results:
+                entry = _summarize_entry(meta, metrics)
+                entries.append(entry)
+                if entry["delta"] is not None:
+                    seen.add((entry["aggregate"], round(float(entry["delta"]), 8)))
+
+        def run_initial_grid():
+            task_batch: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
             for delta in delta_candidates:
                 for agg in agg_candidates:
-                    meta = {"stage": "calib", "optimizer": opt, "spectral": spec, "ebc": "on", "delta": delta, "aggregate": agg, "lr": lr}
+                    meta = {
+                        "stage": "calib",
+                        "optimizer": opt,
+                        "spectral": spec,
+                        "ebc": "on",
+                        "delta": float(delta),
+                        "aggregate": agg,
+                        "lr": base_lr,
+                    }
                     label = f"calib_{job_label(meta)}"
-                    cfg = make_config(clone_args(warm_args, lr=lr), opt, ebc=True, spectral=spec_bool, delta=delta, aggregate=agg, run_dir=out_dir, job_id=label)
-                    ebc_tasks.append((meta, cfg))
+                    cfg = make_config(
+                        clone_args(warm_args, lr=base_lr),
+                        opt,
+                        ebc=True,
+                        spectral=spec_bool,
+                        delta=float(delta),
+                        aggregate=agg,
+                        run_dir=out_dir,
+                        job_id=label,
+                    )
+                    task_batch.append((meta, cfg))
+            if task_batch:
+                record(launch_queue(task_batch))
 
-    ebc_results = launch_queue(ebc_tasks)
+        def run_single(delta: float, aggregate: str, tag: str):
+            key_id = (aggregate, round(float(delta), 8))
+            if key_id in seen:
+                return None
+            meta = {
+                "stage": tag,
+                "optimizer": opt,
+                "spectral": spec,
+                "ebc": "on",
+                "delta": float(delta),
+                "aggregate": aggregate,
+                "lr": base_lr,
+            }
+            label = f"{tag}_{job_label(meta)}_d{str(delta).replace('.', 'p')}"
+            cfg = make_config(
+                clone_args(warm_args, lr=base_lr),
+                opt,
+                ebc=True,
+                spectral=spec_bool,
+                delta=float(delta),
+                aggregate=aggregate,
+                run_dir=out_dir,
+                job_id=label,
+            )
+            record(launch_queue([(meta, cfg)]))
+            return entries[-1]
 
-    # Pick EBC winner per base
-    winners: Dict[Tuple[str, str], Optional[Dict[str, Any]]] = { (o,s): None for o in optimizers for s in spectral_opts }
+        run_initial_grid()
+        if not entries:
+            return None, entries, {"status": "no_candidates"}
+
+        focus_agg = None
+        best_val = float("inf")
+        for agg in agg_candidates:
+            agg_entries = [e for e in entries if e.get("aggregate") == agg]
+            if not agg_entries:
+                continue
+            best_entry = min(agg_entries, key=lambda e: e["val_loss"])
+            if best_entry["val_loss"] < best_val:
+                best_val = best_entry["val_loss"]
+                focus_agg = agg
+        if focus_agg is None:
+            focus_agg = agg_candidates[0] if agg_candidates else args.ebc_aggregate
+
+        def focus_list() -> List[Dict[str, Any]]:
+            return sorted(
+                [e for e in entries if e.get("aggregate") == focus_agg and e.get("delta") is not None],
+                key=lambda e: e["delta"],
+            )
+
+        attempts = 0
+        while attempts < delta_iters:
+            current = focus_list()
+            if not current:
+                break
+            if any(clip_lo <= e["clip_rate"] <= clip_hi for e in current):
+                break
+
+            bracket_delta = None
+            for left, right in zip(current, current[1:]):
+                c_left = left["clip_rate"]
+                c_right = right["clip_rate"]
+                if (c_left > clip_hi and c_right < clip_lo) or (c_left < clip_lo and c_right > clip_hi):
+                    bracket_delta = math.sqrt(left["delta"] * right["delta"])
+                    break
+            if bracket_delta is None:
+                clip_values = [e["clip_rate"] for e in current]
+                if clip_values and all(c > clip_hi for c in clip_values):
+                    bracket_delta = min(current[-1]["delta"] * delta_expand, delta_max)
+                elif clip_values and all(c < clip_lo for c in clip_values):
+                    bracket_delta = max(current[0]["delta"] / delta_expand, delta_min)
+            if bracket_delta is None:
+                break
+            if bracket_delta < delta_min or bracket_delta > delta_max:
+                break
+            if any(abs(bracket_delta - e["delta"]) / max(e["delta"], 1e-8) < 1e-3 for e in current):
+                break
+            if run_single(bracket_delta, focus_agg, tag="adelta") is None:
+                break
+            attempts += 1
+
+        focused = focus_list()
+        if not focused:
+            return None, entries, {"status": "no_focus", "focus_aggregate": focus_agg}
+
+        max_allowed = base_val * (1 + args.max_val_degrade)
+        feasible = [e for e in focused if e["val_loss"] <= max_allowed]
+        used_limit = True
+        if not feasible:
+            feasible = focused
+            used_limit = False
+        if not feasible:
+            return None, entries, {"status": "no_feasible", "focus_aggregate": focus_agg}
+
+        in_band = [e for e in feasible if clip_lo <= e["clip_rate"] <= clip_hi]
+        if in_band:
+            chosen = min(in_band, key=lambda e: e["val_loss"])
+            status = "in_band"
+        else:
+            chosen = min(feasible, key=lambda e: (abs(e["clip_rate"] - clip_target), e["val_loss"]))
+            status = "nearest"
+
+        notes = {
+            "status": status,
+            "focus_aggregate": focus_agg,
+            "used_val_limit": used_limit,
+            "samples": [
+                {
+                    "delta": e["delta"],
+                    "aggregate": e["aggregate"],
+                    "clip_rate": e["clip_rate"],
+                    "val_loss": e["val_loss"],
+                }
+                for e in focused
+            ],
+        }
+        notes["winner"] = {
+            "delta": chosen["delta"],
+            "aggregate": chosen["aggregate"],
+            "clip_rate": chosen["clip_rate"],
+            "val_loss": chosen["val_loss"],
+        }
+
+        winner_info = {
+            "delta": chosen["delta"],
+            "aggregate": chosen["aggregate"],
+            "lr": base_lr,
+            "clip_rate": chosen["clip_rate"],
+            "avg_c": chosen["avg_c"],
+            "val_loss": chosen["val_loss"],
+        }
+        return winner_info, entries, notes
+
+    winners: Dict[Tuple[str, str], Optional[Dict[str, Any]]] = { (o, s): None for o in optimizers for s in spectral_opts }
+    calibration_records: Dict[Tuple[str, str], Dict[str, Any]] = {}
     print("[auto] EBC calibration results:")
-    for meta, res in ebc_results:
-        key = (meta["optimizer"], meta["spectral"])
-        ar = res.get("accept_rate")
-        avgc = res.get("avg_c")
-        v = res["val_loss"]
-        print(f"  {key} delta={meta['delta']} {meta['aggregate']} lr={meta['lr']}: val={v:.4f} acc_rate={ar} avg_c={avgc}")
-
-    # Decide best per base using band + loss
-    grouped: Dict[Tuple[str,str], List[Tuple[Dict[str,Any], Dict[str,Any]]]] = {}
-    for meta, res in ebc_results:
-        key = (meta["optimizer"], meta["spectral"])
-        grouped.setdefault(key, []).append((meta, res))
-
-    # If all candidates are extreme (always/no clipping), adaptively expand/shrink delta
-    auto_delta_tasks: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     for opt in optimizers:
         for spec in spectral_opts:
             key = (opt, spec)
-            items = grouped.get(key, [])
-            if not items:
+            if key not in best_lr:
+                calibration_records[key] = {"status": "no_lr"}
                 continue
-            ars = [r.get("accept_rate") for m,r in items if r.get("accept_rate") is not None]
-            if not ars:
+            if skip_bases.get(key, False):
+                calibration_records[key] = {"status": "skipped"}
+                print(f"  {key} skipped (baseline triage)")
                 continue
-            all_zero = all((a is not None and a <= 1e-6) for a in ars)
-            all_one = all((a is not None and abs(a-1.0) < 1e-6) for a in ars)
-            if not (all_zero or all_one):
-                continue
-            # choose an aggregate that did best so far
-            best_meta, best_res = min(items, key=lambda mr: mr[1]["val_loss"])
-            agg = best_meta.get("aggregate") or args.ebc_aggregate
-            spec_bool = (spec == "spec")
-            lr = best_lr.get(key, (None, {"lr": args.lr}))[1]["lr"]
-            # seed delta from max or min candidate
-            d_min = min(delta_candidates)
-            d_max = max(delta_candidates)
-            expand = float(args.auto_delta_expand)
-            iters = int(args.auto_delta_iters)
-            cur = d_max if all_zero else d_min
-            for i in range(iters):
-                if all_zero:
-                    cur *= expand
-                    if cur > args.auto_delta_max:
-                        break
-                else:  # all_one
-                    cur /= expand
-                    if cur < args.auto_delta_min:
-                        break
-                meta = {"stage": "adelta", "optimizer": opt, "spectral": spec, "ebc": "on", "delta": cur, "aggregate": agg, "lr": lr}
-                label = f"adelta_{job_label(meta)}"
-                cfg = make_config(clone_args(warm_args, lr=lr), opt, ebc=True, spectral=spec_bool, delta=cur, aggregate=agg, run_dir=out_dir, job_id=label)
-                auto_delta_tasks.append((meta, cfg))
+            base_lr = best_lr[key][1]["lr"]
+            base_val = baseline_val.get(key, float("inf"))
+            winner_info, entries, notes = calibrate_base(opt, spec, base_lr, base_val)
+            entries_sorted = sorted(
+                [e for e in entries if e.get("delta") is not None],
+                key=lambda e: (e["aggregate"], e["delta"]),
+            )
+            if entries_sorted:
+                for entry in entries_sorted:
+                    print(
+                        f"  {key} delta={entry['delta']} {entry['aggregate']} lr={entry['lr']}: val={entry['val_loss']:.4f} clip_rate={entry['clip_rate']}"
+                    )
+            else:
+                print(f"  {key} produced no EBC samples")
+            calibration_records[key] = {
+                "status": notes.get("status", "unknown"),
+                "entries": [
+                    {
+                        "delta": e["delta"],
+                        "aggregate": e["aggregate"],
+                        "clip_rate": e["clip_rate"],
+                        "val_loss": e["val_loss"],
+                        "lr": e["lr"],
+                        "stage": e.get("stage"),
+                    }
+                    for e in entries_sorted
+                ],
+                "notes": notes,
+            }
+            winners[key] = winner_info
+            if winner_info is None:
+                print(f"  -> No viable delta found for {key}")
 
-    if auto_delta_tasks:
-        print("[auto] Adaptive delta attempts:")
-        adelta_results = launch_queue(auto_delta_tasks)
-        for meta,res in adelta_results:
-            print(f"  {(meta['optimizer'], meta['spectral'])} delta={meta['delta']} {meta['aggregate']} lr={meta['lr']}: val={res['val_loss']:.4f} acc_rate={res.get('accept_rate')} avg_c={res.get('avg_c')}")
-        # merge into grouped
-        for meta, res in adelta_results:
-            key = (meta["optimizer"], meta["spectral"])
-            grouped.setdefault(key, []).append((meta, res))
-
-    for key, items in grouped.items():
-        base_val = baseline_val.get(key, float("inf"))
-        band = []
-        best_any = None
-        for meta, res in items:
-            ar = res.get("accept_rate")
-            if ar is not None and args.accept_lo <= ar <= args.accept_hi:
-                band.append((res["val_loss"], meta))
-            # track best val overall
-            if (best_any is None) or (res["val_loss"] < best_any[0]):
-                best_any = (res["val_loss"], meta)
-        pick = None
-        if band:
-            # pick lowest val in band
-            pick = sorted(band, key=lambda x: x[0])[0][1]
-        else:
-            # allow small degrade vs baseline
-            if best_any and (best_any[0] <= base_val * (1 + args.max_val_degrade)):
-                pick = best_any[1]
-        winners[key] = pick
-
-    # Stage 2b: LR-scale sweep for EBC + control baselines
+    # Stage 2b: LR-scale sweep for EBC + paired control baselines
     scale_tasks: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     scale_ctrl_tasks: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     for opt in optimizers:
         for spec in spectral_opts:
             key = (opt, spec)
-            winner = winners.get(key)
-            if not winner:
+            winner_info = winners.get(key)
+            if not winner_info or skip_bases.get(key, False):
                 continue
             spec_bool = (spec == "spec")
-            lr0 = best_lr[key][1]["lr"] if key in best_lr else args.lr
+            base_lr = best_lr[key][1]["lr"] if key in best_lr else args.lr
+            delta = winner_info["delta"]
+            aggregate = winner_info["aggregate"]
             for s in lr_scales:
-                lr_s = lr0 * s
-                # EBC scaled task
-                meta_e = {"stage": "scale", "optimizer": opt, "spectral": spec, "ebc": "on", "delta": winner["delta"], "aggregate": winner["aggregate"], "lr": lr_s, "lr_scale": s}
-                label_e = f"scale_{job_label(meta_e)}_x{str(s).replace('.','p')}"
-                cfg_e = make_config(clone_args(warm_args, lr=lr_s), opt, ebc=True, spectral=spec_bool, delta=winner["delta"], aggregate=winner["aggregate"], run_dir=out_dir, job_id=label_e)
+                lr_scaled = base_lr * s
+                meta_e = {
+                    "stage": "scale",
+                    "optimizer": opt,
+                    "spectral": spec,
+                    "ebc": "on",
+                    "delta": delta,
+                    "aggregate": aggregate,
+                    "lr": lr_scaled,
+                    "lr_scale": s,
+                }
+                label_e = f"scale_{job_label(meta_e)}_x{str(s).replace('.', 'p')}"
+                cfg_e = make_config(
+                    clone_args(warm_args, lr=lr_scaled),
+                    opt,
+                    ebc=True,
+                    spectral=spec_bool,
+                    delta=delta,
+                    aggregate=aggregate,
+                    run_dir=out_dir,
+                    job_id=label_e,
+                )
                 scale_tasks.append((meta_e, cfg_e))
-                # Control baseline at scaled LR
-                meta_c = {"stage": "scale_ctrl", "optimizer": opt, "spectral": spec, "ebc": "off", "delta": None, "aggregate": None, "lr": lr_s, "lr_scale": s}
-                label_c = f"scale_ctrl_{job_label(meta_c)}_x{str(s).replace('.','p')}"
-                cfg_c = make_config(clone_args(warm_args, lr=lr_s), opt, ebc=False, spectral=spec_bool, run_dir=out_dir, job_id=label_c)
+
+                meta_c = {
+                    "stage": "scale_ctrl",
+                    "optimizer": opt,
+                    "spectral": spec,
+                    "ebc": "off",
+                    "delta": None,
+                    "aggregate": None,
+                    "lr": lr_scaled,
+                    "lr_scale": s,
+                }
+                label_c = f"scale_ctrl_{job_label(meta_c)}_x{str(s).replace('.', 'p')}"
+                cfg_c = make_config(
+                    clone_args(warm_args, lr=lr_scaled),
+                    opt,
+                    ebc=False,
+                    spectral=spec_bool,
+                    run_dir=out_dir,
+                    job_id=label_c,
+                )
                 scale_ctrl_tasks.append((meta_c, cfg_c))
 
     scale_results: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
@@ -517,43 +752,81 @@ def run_auto_pipeline(args, out_dir: Path):
     if scale_ctrl_tasks:
         scale_ctrl_results = launch_queue(scale_ctrl_tasks)
 
-    # Choose best LR scale per base
-    scale_grouped: Dict[Tuple[str, str], List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
-    ctrl_grouped: Dict[Tuple[str, str], List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
+    scale_records: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    chosen_scale: Dict[Tuple[str, str], Optional[float]] = {}
+
+    if scale_results:
+        print("[auto] EBC LR scale results:")
+    scale_entries: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
     for meta, res in scale_results:
         key = (meta["optimizer"], meta["spectral"])
-        scale_grouped.setdefault(key, []).append((meta, res))
+        entry = _summarize_entry(meta, res)
+        scale_entries.setdefault(key, []).append(entry)
+        print(
+            f"  {key} scale={meta.get('lr_scale', 1)}: val={res['val_loss']:.4f} clip_rate={res.get('clip_rate')}"
+        )
+
+    ctrl_entries: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    if scale_ctrl_results:
+        print("[auto] Control LR scale baselines:")
     for meta, res in scale_ctrl_results:
         key = (meta["optimizer"], meta["spectral"])
-        ctrl_grouped.setdefault(key, []).append((meta, res))
+        entry = _summarize_entry(meta, res)
+        ctrl_entries.setdefault(key, []).append(entry)
+        print(
+            f"  {key} ctrl scale={meta.get('lr_scale', 1)}: val={res['val_loss']:.4f}"
+        )
 
-    chosen_scale: Dict[Tuple[str, str], Optional[float]] = {k: None for k in winners}
-    scale_notes: Dict[str, Any] = {}
-    for key, items in scale_grouped.items():
-        if not winners.get(key):
-            continue
-        base_val = baseline_val.get(key, float("inf"))
-        viable = []
-        for meta, res in items:
-            s = float(meta.get("lr_scale", 1.0))
-            ar = res.get("accept_rate")
-            v = res["val_loss"]
-            if (ar is not None and args.accept_lo <= ar <= args.accept_hi) and (v <= base_val * (1 + args.scale_max_val_degrade)):
-                viable.append((s, v, meta, res))
-        if viable:
-            viable.sort(key=lambda x: (x[0], -x[1]))
-            s_pick, v_pick, m_pick, r_pick = viable[-1]
-            chosen_scale[key] = s_pick
-            scale_notes["|".join(key)] = {"lr_scale": s_pick, "val_loss": v_pick, "accept_rate": r_pick.get("accept_rate")}
-        else:
-            # fallback to best v across scales if within cap
-            items_sorted = sorted(items, key=lambda mr: mr[1]["val_loss"])
-            if items_sorted and items_sorted[0][1]["val_loss"] <= base_val * (1 + args.scale_max_val_degrade):
-                s_pick = float(items_sorted[0][0].get("lr_scale", 1.0))
-                chosen_scale[key] = s_pick
-                scale_notes["|".join(key)] = {"lr_scale": s_pick, "val_loss": items_sorted[0][1]["val_loss"], "accept_rate": items_sorted[0][1].get("accept_rate")}
-            else:
-                scale_notes["|".join(key)] = {"lr_scale": None}
+    for opt in optimizers:
+        for spec in spectral_opts:
+            key = (opt, spec)
+            winner_info = winners.get(key)
+            if not winner_info or skip_bases.get(key, False):
+                chosen_scale[key] = None
+                continue
+            entries = scale_entries.get(key, [])
+            base_val = baseline_val.get(key, float("inf"))
+            limit = base_val * (1 + args.scale_max_val_degrade)
+            best = None
+            # Prefer highest scale within clip band and val limit
+            candidates = []
+            for entry in entries:
+                scale = float(entry["meta"].get("lr_scale", 1.0))
+                val_loss = entry["val_loss"]
+                clip = entry["clip_rate"]
+                in_band = clip_lo <= clip <= clip_hi
+                within = val_loss <= limit
+                if within:
+                    candidates.append((scale, in_band, val_loss, entry))
+            chosen = None
+            if candidates:
+                # sort by (band priority, scale descending, val ascending)
+                candidates.sort(key=lambda x: (not x[1], -x[0], x[2]))
+                chosen = candidates[0]
+            elif entries:
+                # fallback to lowest val even if exceeding limit
+                entries.sort(key=lambda e: e["val_loss"])
+                entry = entries[0]
+                chosen = (float(entry["meta"].get("lr_scale", 1.0)), False, entry["val_loss"], entry)
+
+            chosen_scale[key] = chosen[0] if chosen else None
+            scale_records[key] = {
+                "entries": [
+                    {
+                        "lr_scale": float(e["meta"].get("lr_scale", 1.0)),
+                        "clip_rate": e["clip_rate"],
+                        "val_loss": e["val_loss"],
+                    }
+                    for e in sorted(entries, key=lambda e: float(e["meta"].get("lr_scale", 1.0)))
+                ],
+                "controls": [
+                    {
+                        "lr_scale": float(e["meta"].get("lr_scale", 1.0)),
+                        "val_loss": e["val_loss"],
+                    }
+                    for e in sorted(ctrl_entries.get(key, []), key=lambda e: float(e["meta"].get("lr_scale", 1.0)))
+                ],
+            }
 
     # Stage 3: Final full runs for baseline + winners
     final_steps = int(args.final_steps or args.steps)
@@ -561,50 +834,103 @@ def run_auto_pipeline(args, out_dir: Path):
     final_tasks: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     for opt in optimizers:
         for spec in spectral_opts:
-            spec_bool = (spec == "spec")
             key = (opt, spec)
-            lr = best_lr[key][1]["lr"] if key in best_lr else args.lr
-            # baseline
-            base_meta = {"stage": "final", "optimizer": opt, "spectral": spec, "ebc": "off", "delta": None, "aggregate": None, "lr": lr}
+            if skip_bases.get(key, False):
+                continue
+            spec_bool = (spec == "spec")
+            base_lr = best_lr[key][1]["lr"] if key in best_lr else args.lr
+            base_meta = {
+                "stage": "final",
+                "optimizer": opt,
+                "spectral": spec,
+                "ebc": "off",
+                "delta": None,
+                "aggregate": None,
+                "lr": base_lr,
+            }
             base_label = f"final_{job_label(base_meta)}"
-            base_cfg = make_config(clone_args(final_args, lr=lr), opt, ebc=False, spectral=spec_bool, run_dir=out_dir, job_id=base_label)
+            base_cfg = make_config(
+                clone_args(final_args, lr=base_lr),
+                opt,
+                ebc=False,
+                spectral=spec_bool,
+                run_dir=out_dir,
+                job_id=base_label,
+            )
             final_tasks.append((base_meta, base_cfg))
-            # ebc winner
-            if winners.get(key):
-                m = winners[key]
-                s = chosen_scale.get(key)
-                lr_e = lr * (s if s is not None else 1.0)
-                ebc_meta = {"stage": "final", "optimizer": opt, "spectral": spec, "ebc": "on", "delta": m["delta"], "aggregate": m["aggregate"], "lr": lr_e, "lr_scale": (s if s is not None else 1.0)}
-                ebc_label = f"final_{job_label(ebc_meta)}"
-                ebc_cfg = make_config(clone_args(final_args, lr=lr_e), opt, ebc=True, spectral=spec_bool, delta=m["delta"], aggregate=m["aggregate"], run_dir=out_dir, job_id=ebc_label)
-                final_tasks.append((ebc_meta, ebc_cfg))
-                if s is not None and s != 1.0:
-                    ctrl_meta = {"stage": "final", "optimizer": opt, "spectral": spec, "ebc": "off", "delta": None, "aggregate": None, "lr": lr_e, "lr_scale": s}
-                    ctrl_label = f"final_ctrl_{job_label(ctrl_meta)}"
-                    ctrl_cfg = make_config(clone_args(final_args, lr=lr_e), opt, ebc=False, spectral=spec_bool, run_dir=out_dir, job_id=ctrl_label)
-                    final_tasks.append((ctrl_meta, ctrl_cfg))
 
-    final_results = launch_queue(final_tasks)
+            winner_info = winners.get(key)
+            if not winner_info:
+                continue
+            scale_choice = chosen_scale.get(key)
+            lr_scale = scale_choice if scale_choice is not None else 1.0
+            lr_ebc = base_lr * lr_scale
+            ebc_meta = {
+                "stage": "final",
+                "optimizer": opt,
+                "spectral": spec,
+                "ebc": "on",
+                "delta": winner_info["delta"],
+                "aggregate": winner_info["aggregate"],
+                "lr": lr_ebc,
+                "lr_scale": lr_scale,
+            }
+            ebc_label = f"final_{job_label(ebc_meta)}"
+            ebc_cfg = make_config(
+                clone_args(final_args, lr=lr_ebc),
+                opt,
+                ebc=True,
+                spectral=spec_bool,
+                delta=winner_info["delta"],
+                aggregate=winner_info["aggregate"],
+                run_dir=out_dir,
+                job_id=ebc_label,
+            )
+            final_tasks.append((ebc_meta, ebc_cfg))
+
+            if lr_scale and lr_scale > 1.0:
+                ctrl_meta = {
+                    "stage": "final",
+                    "optimizer": opt,
+                    "spectral": spec,
+                    "ebc": "off",
+                    "delta": None,
+                    "aggregate": None,
+                    "lr": lr_ebc,
+                    "lr_scale": lr_scale,
+                }
+                ctrl_label = f"final_ctrl_{job_label(ctrl_meta)}"
+                ctrl_cfg = make_config(
+                    clone_args(final_args, lr=lr_ebc),
+                    opt,
+                    ebc=False,
+                    spectral=spec_bool,
+                    run_dir=out_dir,
+                    job_id=ctrl_label,
+                )
+                final_tasks.append((ctrl_meta, ctrl_cfg))
+
+    final_results = launch_queue(final_tasks) if final_tasks else []
 
     # Write summaries/plots
-    print("optimizer,spectral,ebc,delta,aggregate,wall_clock,val_loss,val_acc,ppl,accept_rate,avg_c")
+    print("optimizer,spectral,ebc,delta,aggregate,wall_clock,val_loss,val_acc,ppl,clip_rate,avg_c")
     out_summary: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     for meta, res in final_results:
         out_summary.append((meta, res))
-        accept_display = "" if res["accept_rate"] is None else f"{res['accept_rate']:.2f}"
+        clip_display = "" if res["clip_rate"] is None else f"{res['clip_rate']:.2f}"
         avgc_display = "" if res["avg_c"] is None else f"{res['avg_c']:.3f}"
         print(
-            f"{meta['optimizer']},{meta['spectral']},{meta['ebc']},{meta.get('delta')},{meta.get('aggregate')},{res['wall_clock']:.2f},{res['val_loss']:.4f},{res['val_acc']:.4f},{res['ppl']:.2f},{accept_display},{avgc_display}"
+            f"{meta['optimizer']},{meta['spectral']},{meta['ebc']},{meta.get('delta')},{meta.get('aggregate')},{res['wall_clock']:.2f},{res['val_loss']:.4f},{res['val_acc']:.4f},{res['ppl']:.2f},{clip_display},{avgc_display}"
         )
         plot_run(res["history"], job_label(meta), out_dir, job_display(meta))
 
     # Save CSV summary for finals
     csv_path = out_dir / "summary_final.csv"
     with open(csv_path, "w") as f:
-        f.write("optimizer,spectral,ebc,delta,aggregate,lr,wall_clock,val_loss,val_acc,ppl,accept_rate,avg_c\n")
+        f.write("optimizer,spectral,ebc,delta,aggregate,lr,wall_clock,val_loss,val_acc,ppl,clip_rate,avg_c\n")
         for meta, res in out_summary:
             f.write(
-                f"{meta['optimizer']},{meta['spectral']},{meta['ebc']},{'' if meta['delta'] is None else meta['delta']},{'' if meta['aggregate'] is None else meta['aggregate']},{meta.get('lr')},{res['wall_clock']:.2f},{res['val_loss']:.6f},{res['val_acc']:.6f},{res['ppl']:.3f},{res['accept_rate']},{res['avg_c']}\n"
+                f"{meta['optimizer']},{meta['spectral']},{meta['ebc']},{'' if meta['delta'] is None else meta['delta']},{'' if meta['aggregate'] is None else meta['aggregate']},{meta.get('lr')},{res['wall_clock']:.2f},{res['val_loss']:.6f},{res['val_acc']:.6f},{res['ppl']:.3f},{res['clip_rate']},{res['avg_c']}\n"
             )
 
     # Dump JSON
@@ -616,18 +942,29 @@ def run_auto_pipeline(args, out_dir: Path):
 
     # Decisions dump
     decisions = {
-        "best_lr": {"|".join(k): v[1]["lr"] for k, v in best_lr.items()},
-        "winners": {"|".join(k): winners[k] for k in winners},
-        "chosen_scale": {"|".join(k): chosen_scale.get(k) for k in chosen_scale} if 'chosen_scale' in locals() else {},
+        "best_lr": {
+            "|".join(k): {
+                "lr": best_lr[k][1]["lr"],
+                "val_loss": best_lr[k][0],
+            }
+            for k in best_lr
+        },
+        "baseline_val": {"|".join(k): baseline_val.get(k) for k in best_lr},
+        "skip_bases": {"|".join(k): bool(skip_bases.get(k, False)) for k in best_lr},
+        "calibration": {"|".join(k): calibration_records.get(k, {}) for k in winners},
+        "winners": {"|".join(k): winners.get(k) for k in winners},
+        "chosen_scale": {"|".join(k): chosen_scale.get(k) for k in chosen_scale},
+        "scale_records": {"|".join(k): scale_records.get(k, {}) for k in winners},
         "settings": {
-            "accept_band": [args.accept_lo, args.accept_hi],
+            "clip_band": [clip_lo, clip_hi],
+            "clip_target": clip_target,
             "max_val_degrade": args.max_val_degrade,
-            "scale_max_val_degrade": getattr(args, 'scale_max_val_degrade', None),
+            "scale_max_val_degrade": getattr(args, "scale_max_val_degrade", None),
             "warmup_steps": args.auto_warmup_steps,
             "final_steps": final_steps,
             "ebc_lr_scales": lr_scales,
+            "skip_threshold": skip_threshold,
         },
-        "scale_notes": locals().get('scale_notes', {}),
     }
     with open(out_dir / "auto_decisions.json", "w") as f:
         json.dump(decisions, f, indent=2)
@@ -644,7 +981,53 @@ def _read_json(p: Path) -> Any:
         return json.load(f)
 
 
-def _launch_single_task_subprocess(task: Tuple[Dict[str, Any], Dict[str, Any]], gpu_id: int, tmp_dir: Path, python_exe: str = None) -> Tuple[subprocess.Popen, Path, Dict[str, Any], int]:
+def print_status(run_dir: Path):
+    run_dir = Path(run_dir)
+    if not run_dir.exists():
+        print(f"Run directory {run_dir} does not exist")
+        return
+
+    ckpt_root = run_dir / "ckpts"
+    if not ckpt_root.exists():
+        print(f"No checkpoints found under {ckpt_root}")
+        return
+
+    entries = []
+    for job_dir in sorted(ckpt_root.iterdir()):
+        if not job_dir.is_dir():
+            continue
+        done_path = job_dir / "done.json"
+        latest_path = job_dir / "latest.pkl"
+        status = "PENDING"
+        detail = ""
+        if done_path.exists():
+            status = "DONE"
+            try:
+                data = _read_json(done_path)
+                val_loss = data.get("val_loss")
+                if val_loss is not None:
+                    detail = f"val_loss={val_loss:.4f}"
+            except Exception:
+                detail = "done.json unreadable"
+        elif latest_path.exists():
+            status = "RESUMABLE"
+        else:
+            log_glob = list(job_dir.glob("*.log"))
+            if log_glob:
+                status = "RUNNING"
+        entries.append((job_dir.name, status, detail))
+
+    if not entries:
+        print(f"No job directories found under {ckpt_root}")
+        return
+
+    print(f"Status for {run_dir}:")
+    print(f"{'job':<60} {'status':<10} detail")
+    for name, status, detail in entries:
+        print(f"{name:<60} {status:<10} {detail}")
+
+
+def _launch_single_task_subprocess(task: Tuple[Dict[str, Any], Dict[str, Any]], gpu_id: int, tmp_dir: Path, python_exe: str = None) -> Tuple[subprocess.Popen, Path, Dict[str, Any], int, Tuple[Dict[str, Any], Dict[str, Any]]]:
     """Launch a subprocess pinned to one GPU to run a single task and write result JSON.
 
     Returns (proc, out_path, meta)
@@ -668,19 +1051,19 @@ def _launch_single_task_subprocess(task: Tuple[Dict[str, Any], Dict[str, Any]], 
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     cmd = [python_exe, "-m", "scripts.run_shakespeare_ebc_ablation", "--single_task", str(in_path), "--single_task_out", str(out_path)]
     proc = subprocess.Popen(cmd, env=env)
-    return proc, out_path, meta, gpu_id
+    return proc, out_path, meta, gpu_id, task
 
 
-def _drain_finished(procs: List[Tuple[subprocess.Popen, Path, Dict[str, Any], int]]) -> List[Tuple[Dict[str, Any], Dict[str, Any], int]]:
+def _drain_finished(procs: List[Tuple[subprocess.Popen, Path, Dict[str, Any], int, Tuple[Dict[str, Any], Dict[str, Any]]]]) -> List[Tuple[Dict[str, Any], Dict[str, Any], int]]:
     finished: List[Tuple[Dict[str, Any], Dict[str, Any], int]] = []
-    still_running: List[Tuple[subprocess.Popen, Path, Dict[str, Any], int]] = []
-    for p, outp, meta, gid in procs:
+    still_running: List[Tuple[subprocess.Popen, Path, Dict[str, Any], int, Tuple[Dict[str, Any], Dict[str, Any]]]] = []
+    for p, outp, meta, gid, task in procs:
         ret = p.poll()
         if ret is None:
-            still_running.append((p, outp, meta, gid))
+            still_running.append((p, outp, meta, gid, task))
         else:
             if ret != 0:
-                raise RuntimeError(f"Subprocess failed for {meta} with return code {ret}")
+                raise TaskFailed(meta, ret, outp, task)
             res = _read_json(outp)
             finished.append((meta, res, gid))
     procs[:] = still_running
@@ -691,6 +1074,7 @@ def main():
     p = argparse.ArgumentParser(description="Shakespeare EBC ablation")
     p.add_argument("--output_dir", type=Path, default=Path("outputs/ebc_ablation"))
     p.add_argument("--run_dir", type=Path, default=None, help="Optional: reuse an existing run directory to resume an interrupted sweep")
+    p.add_argument("--status", action="store_true", help="Print status summary for a run directory and exit")
     # Model/data
     p.add_argument("--vocab_size", type=int, default=65)
     p.add_argument("--num_heads", type=int, default=4)
@@ -709,6 +1093,7 @@ def main():
     # Dtype / JIT
     p.add_argument("--model_dtype", type=str, default="float32", choices=["float32", "bfloat16", "float64"], help="Computation/param dtype")
     p.add_argument("--project_dtype", type=str, default="float32", choices=["float32", "bfloat16", "float64"], help="Projection ops dtype")
+    p.add_argument("--spectral_backend", type=str, default="auto", choices=["auto", "gpu", "cpu"], help="Where to compute spectral normalization estimates")
     p.add_argument("--jit", action="store_true", help="Enable JIT compile of loss/backprop")
     # EBC defaults
     p.add_argument("--ebc_target_kl", type=float, default=0.05)
@@ -737,8 +1122,9 @@ def main():
     p.add_argument("--ebc_deltas_auto", type=str, default="0.5,1.0,2.0")
     p.add_argument("--ebc_aggregates_auto", type=str, default="l2,l1")
     p.add_argument("--ebc_lr_scales", type=str, default="1,1.5,2,3", help="LR multipliers to test for EBC headroom after delta selection")
-    p.add_argument("--accept_lo", type=float, default=0.1)
-    p.add_argument("--accept_hi", type=float, default=0.7)
+    p.add_argument("--accept_lo", type=float, default=0.2, help="Lower bound on desired clip rate during calibration")
+    p.add_argument("--accept_hi", type=float, default=0.6, help="Upper bound on desired clip rate during calibration")
+    p.add_argument("--clip_target", type=float, default=None, help="Preferred clip rate target; defaults to midpoint of [accept_lo, accept_hi]")
     p.add_argument("--max_val_degrade", type=float, default=0.02, help="Max allowed relative val loss degrade vs baseline at warmup (e.g., 0.02 = 2%)")
     p.add_argument("--scale_max_val_degrade", type=float, default=0.03, help="Max allowed relative warmup val loss degrade vs baseline when scaling LR under EBC")
     # Adaptive delta search knobs
@@ -746,6 +1132,8 @@ def main():
     p.add_argument("--auto_delta_max", type=float, default=8.0, help="Upper bound for adaptive delta search")
     p.add_argument("--auto_delta_expand", type=float, default=2.0, help="Multiplicative factor when expanding/shrinking delta adaptively")
     p.add_argument("--auto_delta_iters", type=int, default=3, help="Max additional attempts per base to adaptively search delta")
+    p.add_argument("--auto_skip_threshold", type=float, default=0.2, help="Skip optimizers whose baseline val is worse than best by this relative fraction")
+    p.add_argument("--task_retry", type=int, default=2, help="Number of retries for failed subprocess jobs in --auto mode")
     p.add_argument("--final_steps", type=int, default=None, help="Override final training steps for winners (defaults to --steps)")
     p.add_argument("--num_gpus", type=int, default=1, help="For --auto: concurrent tasks pinned one per GPU using CUDA_VISIBLE_DEVICES 0..N-1")
     # Checkpointing / resume
@@ -768,6 +1156,11 @@ def main():
             _write_json(args.single_task_out, res)
         return
 
+    if args.status:
+        target_dir = args.run_dir if args.run_dir is not None else args.output_dir
+        print_status(target_dir)
+        return
+
     if args.run_dir is not None:
         out_dir = args.run_dir
     else:
@@ -782,7 +1175,7 @@ def main():
     aggregates = [s.strip() for s in args.aggregates.split(",") if s.strip()]
 
     summary_rows: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
-    print("optimizer,spectral,ebc,delta,aggregate,wall_clock,val_loss,val_acc,ppl,accept_rate,avg_c")
+    print("optimizer,spectral,ebc,delta,aggregate,wall_clock,val_loss,val_acc,ppl,clip_rate,avg_c")
 
     # Warm dataset once (avoids parallel download race producing empty memmaps)
     warm_cfg_dict = make_config(args, optimizers[0], ebc=False, spectral=False, run_dir=out_dir, job_id="_warm")
@@ -816,10 +1209,10 @@ def main():
 
     def handle_result(meta: Dict[str, Any], res: Dict[str, Any]):
         summary_rows.append((meta, res))
-        accept_display = "" if res["accept_rate"] is None else f"{res['accept_rate']:.2f}"
+        clip_display = "" if res["clip_rate"] is None else f"{res['clip_rate']:.2f}"
         avgc_display = "" if res["avg_c"] is None else f"{res['avg_c']:.3f}"
         print(
-            f"{meta['optimizer']},{meta['spectral']},{meta['ebc']},{meta.get('delta')},{meta.get('aggregate')},{res['wall_clock']:.2f},{res['val_loss']:.4f},{res['val_acc']:.4f},{res['ppl']:.2f},{accept_display},{avgc_display}"
+            f"{meta['optimizer']},{meta['spectral']},{meta['ebc']},{meta.get('delta')},{meta.get('aggregate')},{res['wall_clock']:.2f},{res['val_loss']:.4f},{res['val_acc']:.4f},{res['ppl']:.2f},{clip_display},{avgc_display}"
         )
         label = job_label(meta)
         title = job_display(meta)
@@ -850,10 +1243,10 @@ def main():
     # Save CSV summary
     csv_path = out_dir / "summary.csv"
     with open(csv_path, "w") as f:
-        f.write("optimizer,spectral,ebc,delta,aggregate,wall_clock,val_loss,val_acc,ppl,accept_rate,avg_c\n")
+        f.write("optimizer,spectral,ebc,delta,aggregate,wall_clock,val_loss,val_acc,ppl,clip_rate,avg_c\n")
         for meta, res in summary_rows:
             f.write(
-                f"{meta['optimizer']},{meta['spectral']},{meta['ebc']},{'' if meta['delta'] is None else meta['delta']},{'' if meta['aggregate'] is None else meta['aggregate']},{res['wall_clock']:.2f},{res['val_loss']:.6f},{res['val_acc']:.6f},{res['ppl']:.3f},{res['accept_rate']},{res['avg_c']}\n"
+                f"{meta['optimizer']},{meta['spectral']},{meta['ebc']},{'' if meta['delta'] is None else meta['delta']},{'' if meta['aggregate'] is None else meta['aggregate']},{res['wall_clock']:.2f},{res['val_loss']:.6f},{res['val_acc']:.6f},{res['ppl']:.3f},{res['clip_rate']},{res['avg_c']}\n"
             )
 
     # Simple Pareto: val PPL vs avg clip (EBC only)

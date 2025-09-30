@@ -16,11 +16,13 @@ def MLP(
     sensitive_to_wmax=None,
     **kwargs,
 ):
+    spectral_backend = kwargs.get("spectral_backend", "auto")
     project_kwargs = {
         "dtype": dtype,
         "project_dtype": project_dtype,
         "project": project,
         "sensitive_to_wmax": sensitive_to_wmax,
+        "spectral_backend": spectral_backend,
     }
     m = Linear(output_dim, d_embed, **project_kwargs, tracker="mlp_out") @ ReLU()
     for i in range(num_blocks - 2):
@@ -48,10 +50,12 @@ def Attention(
 ):
     """Multi-head attention"""
 
+    spectral_backend = kwargs.get("spectral_backend", "auto")
     project_kwargs = {
         "dtype": dtype,
         "project_dtype": project_dtype,
         "project": project,
+        "spectral_backend": spectral_backend,
     }
     Q = SplitIntoHeads(num_heads) @ Linear(
         num_heads * d_query, d_embed, **project_kwargs, tracker=f"q{layer_idx}"
@@ -111,10 +115,12 @@ def GPT(
     layernorm_substitute="none",
     **kwargs,
 ):
+    spectral_backend = kwargs.get("spectral_backend", "auto")
     project_kwargs = {
         "dtype": dtype,
         "project_dtype": project_dtype,
         "project": project,
+        "spectral_backend": spectral_backend,
     }
     layernorm_substitute = layernorm_lookup[layernorm_substitute]
 

@@ -10,6 +10,7 @@ def create_model(config):
     }
     kwargs["dtype"] = config.dtype
     kwargs["project_dtype"] = config.project_dtype
+    kwargs["spectral_backend"] = getattr(config, "spectral_backend", "auto")
     kwargs["sensitive_to_wmax"] = {
         marker: project in ["hard_cap", "orthogonal", "spec_normalize"]
         for marker, project in config.project.items()

@@ -72,5 +72,7 @@ def parse_config_from_json(config_dict):
         config.post_dualize = False
     if not hasattr(config, "jit"):
         config.jit = True
+    if not hasattr(config, "spectral_backend"):
+        config.spectral_backend = "auto"
 
     return config

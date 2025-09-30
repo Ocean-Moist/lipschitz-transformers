@@ -47,6 +47,7 @@ def Attention(
     zero_init=False,
     project=None,
     layer_idx=0,
+    **kwargs,
 ):
     """Multi-head attention"""
 

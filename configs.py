@@ -65,6 +65,25 @@ def parse_config_from_json(config_dict):
     if not hasattr(config, "ebc_include_embed_out"):
         config.ebc_include_embed_out = False
 
+    # EBC controller defaults (disabled by default)
+    if not hasattr(config, "ebc_ctrl_enable"):
+        config.ebc_ctrl_enable = False
+    if not hasattr(config, "ebc_ctrl_period"):
+        config.ebc_ctrl_period = 20
+    if not hasattr(config, "ebc_ctrl_kp"):
+        config.ebc_ctrl_kp = 0.15
+    if not hasattr(config, "ebc_ctrl_ki"):
+        config.ebc_ctrl_ki = 0.02
+    if not hasattr(config, "ebc_ctrl_ema_halflife"):
+        config.ebc_ctrl_ema_halflife = 250
+    if not hasattr(config, "ebc_delta_star"):
+        # target applied per-token KL (nats/token) that controller will track
+        config.ebc_delta_star = config.ebc_target_kl
+    if not hasattr(config, "ebc_ctrl_delta_min"):
+        config.ebc_ctrl_delta_min = 0.01
+    if not hasattr(config, "ebc_ctrl_delta_max"):
+        config.ebc_ctrl_delta_max = 0.30
+
     # Trainer defaults
     if not hasattr(config, "pre_dualize"):
         config.pre_dualize = False

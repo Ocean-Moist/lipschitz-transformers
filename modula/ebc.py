@@ -82,13 +82,18 @@ def apply_ebc_clipping(
 
     impacts_arr = jnp.stack(impacts)
     if aggregate == "l1":
+        # Provably safe separable surrogate
         S = jnp.sum(impacts_arr)
+        eff_tau = tau
     elif aggregate == "l2":
+        # Safe L2 requires comparing sqrt(L) * S2 to tau
+        # Equivalently, compare S2 to tau / sqrt(L)
         S = jnp.sqrt(jnp.sum(jnp.square(impacts_arr)))
+        L = max(1, len(scope_indices))
+        eff_tau = tau / jnp.sqrt(jnp.array(L, dtype=tau.dtype))
     else:
         raise ValueError(f"Unknown aggregate: {aggregate}")
 
-    c = jnp.where(S > tau, tau / (S + 1e-12), 1.0)
+    c = jnp.where(S > eff_tau, eff_tau / (S + 1e-12), 1.0)
     clipped = jax.tree_util.tree_map(lambda g: c * g, updates)
     return clipped, S, c
-

@@ -150,6 +150,15 @@ def make_config(
         ebc_aggregate=args.ebc_aggregate if aggregate is None else aggregate,
         ebc_center_logits=True,
         ebc_include_embed_out=False,
+        # EBC controller (optional)
+        ebc_ctrl_enable=bool(getattr(args, "ebc_ctrl_enable", False)),
+        ebc_ctrl_period=int(getattr(args, "ebc_ctrl_period", 20)),
+        ebc_ctrl_kp=float(getattr(args, "ebc_ctrl_kp", 0.15)),
+        ebc_ctrl_ki=float(getattr(args, "ebc_ctrl_ki", 0.02)),
+        ebc_ctrl_ema_halflife=float(getattr(args, "ebc_ctrl_ema_halflife", 250)),
+        ebc_delta_star=float(args.ebc_delta_star) if getattr(args, "ebc_delta_star", None) is not None else args.ebc_target_kl,
+        ebc_ctrl_delta_min=float(getattr(args, "ebc_ctrl_delta_min", 0.01)),
+        ebc_ctrl_delta_max=float(getattr(args, "ebc_ctrl_delta_max", 0.30)),
         # Misc
         jit=bool(args.jit),  # enable with --jit; default False due to RoPE tracer note
         output_dir=str(out_root),
@@ -1102,6 +1111,15 @@ def main():
     p.add_argument("--ebc_beta_ema", type=float, default=0.9)
     p.add_argument("--ebc_safety", type=float, default=1.05)
     p.add_argument("--ebc_aggregate", type=str, default="l1", choices=["l1", "l2"])
+    # EBC controller (optional)
+    p.add_argument("--ebc_ctrl_enable", action="store_true", help="Enable applied-KL PI controller for EBC")
+    p.add_argument("--ebc_ctrl_period", type=int, default=20, help="Probe/update controller every N steps")
+    p.add_argument("--ebc_ctrl_kp", type=float, default=0.15, help="Proportional gain for KL controller")
+    p.add_argument("--ebc_ctrl_ki", type=float, default=0.02, help="Integral gain for KL controller (EMA)")
+    p.add_argument("--ebc_ctrl_ema_halflife", type=float, default=250, help="EMA half-life in steps for KL error integral")
+    p.add_argument("--ebc_delta_star", type=float, default=None, help="Target per-token KL (nats/token) for controller; defaults to --ebc_target_kl")
+    p.add_argument("--ebc_ctrl_delta_min", type=float, default=0.01, help="Min bound for controller's delta")
+    p.add_argument("--ebc_ctrl_delta_max", type=float, default=0.30, help="Max bound for controller's delta")
     # Grid options
     p.add_argument("--optimizers", type=str, default="adam,muon")
     p.add_argument("--spectral", type=str, default="none,spec", help="none or spec, comma-separated")

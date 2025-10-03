@@ -63,6 +63,12 @@ class AblationLogger:
         applied_kl = None
         delta_ctrl = None
         rho = None
+        tau = None
+        S = None
+        S_raw = None
+        beta_mean = None
+        beta_max = None
+        lr = None
         if isinstance(log, dict) and "ebc" in log and isinstance(log["ebc"], dict):
             c = log["ebc"].get("c")
             applied_kl = log["ebc"].get("applied_kl")

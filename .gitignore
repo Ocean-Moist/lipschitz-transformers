@@ -1,46 +1,83 @@
-.DS_Store
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
 
-.modula
-modula.egg-info/
-modula/__pycache__/
+# C extensions
+*.so
 
-docs/build/
-docs/jupyter_execute/
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
 
-docs/source/examples/assets/
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.env/
 
-examples/.ipynb_checkpoints/
-examples/data/*
-!examples/data/*.py
+# PyInstaller
+*.manifest
+*.spec
 
-experiment/data/cifar10_files/
-experiment/data/mnist_files/
-experiment/data/shakespeare/
-experiment/data/fineweb10B
-experiment/data/__pycache__/
-experiment/logs
-experiment/*.png
-experiment/*.gif
-experiment/result*
-experiment/sweep_configs
-experiment/chrysalis
-experiment/dawn
-experiment/scales_plots
-experiment/.env
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
 
-min_train_MLP/__pycache__/
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
 
-outLogs/
+# Jupyter Notebook
+.ipynb_checkpoints
 
-data/cifar10_files
-data/__pycache__/
+# pyenv
+.python-version
 
-experiment/*.pdf
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
 
-*.sh
-
+# IDE/editor
+.idea/
 .vscode/
+*.swp
+*.swo
 
-.env
-=3.9
-pyproject.toml
+# OS files
+.DS_Store
+Thumbs.db
+
+# Project-specific generated assets
+outputs/
+logs/
+data/shakespeare/
+

@@ -128,10 +128,12 @@ class Trainer:
 
             # Update optimizer state and get parameter updates (raw, pre-EBC)
             _, opt_state, updates_raw = self.optimizer.update(params, grads, opt_state)
+            # Default updates are raw; EBC may override below
+            updates = updates_raw
 
-            # Apply post-dualization if needed
+            # Apply post-dualization if needed (to raw updates)
             if self.config.post_dualize:
-                updates = self.model.dualize(updates)
+                updates_raw = self.model.dualize(updates_raw)
 
             # Get learning rate from schedule
             lr = self.get_lr(self.step)
@@ -298,6 +300,10 @@ class Trainer:
                     self._ebc_last["applied_kl"] = float(applied_kl)
                     self._ebc_last["rho"] = rho
                     self._ebc_last["delta_ctrl"] = self._ebc_ctrl_delta
+
+            else:
+                # No EBC: use raw optimizer updates
+                updates = updates_raw
 
             # Update parameters with weight decay and projection
             key, subkey = jax.random.split(key)

@@ -48,6 +48,7 @@ class AblationLogger:
         self.ebc_rho: List[float] = []
         self.ebc_tau: List[float] = []
         self.ebc_tau_scale: List[float] = []
+        self.ebc_surr_scale: List[float] = []
         self.ebc_S: List[float] = []
         self.ebc_S_raw: List[float] = []
         self.ebc_beta_mean: List[float] = []
@@ -83,12 +84,14 @@ class AblationLogger:
             beta_mean = log["ebc"].get("beta_mean")
             beta_max = log["ebc"].get("beta_max")
             lr = log["ebc"].get("lr")
+            surr_scale = log["ebc"].get("surr_scale")
         self.ebc_c.append(None if c is None else float(c))
         self.ebc_applied_kl.append(None if applied_kl is None else float(applied_kl))
         self.ebc_delta_ctrl.append(None if delta_ctrl is None else float(delta_ctrl))
         self.ebc_rho.append(None if rho is None else float(rho))
         self.ebc_tau.append(None if tau is None else float(tau))
         self.ebc_tau_scale.append(None if tau_scale is None else float(tau_scale))
+        self.ebc_surr_scale.append(None if surr_scale is None else float(surr_scale))
         self.ebc_S.append(None if S is None else float(S))
         self.ebc_S_raw.append(None if S_raw is None else float(S_raw))
         self.ebc_beta_mean.append(None if beta_mean is None else float(beta_mean))
@@ -124,6 +127,7 @@ class AblationLogger:
             "ebc_rho": self.ebc_rho,
             "ebc_tau": self.ebc_tau,
             "ebc_tau_scale": self.ebc_tau_scale,
+            "ebc_surr_scale": self.ebc_surr_scale,
             "ebc_S": self.ebc_S,
             "ebc_S_raw": self.ebc_S_raw,
             "ebc_beta_mean": self.ebc_beta_mean,

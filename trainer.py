@@ -40,6 +40,8 @@ class Trainer:
         self._ebc_scope_idx = None  # indices of layers in budget
         self._ebc_probe_pos = 0  # round-robin pointer
         self._ebc_last = None  # last (tau,S,c)
+        # Surrogate calibration state (scale S so that T≈c·S_probe)
+        self._ebc_surr_scale = 1.0
         # EBC PI controller state
         self._ebc_ctrl_enable = bool(getattr(self.config, "ebc_ctrl_enable", False))
         self._ebc_ctrl_period = int(getattr(self.config, "ebc_ctrl_period", 20))
@@ -172,9 +174,9 @@ class Trainer:
                 target_delta = (
                     float(self._ebc_ctrl_delta) if self._ebc_ctrl_enable else float(self.config.ebc_target_kl)
                 )
-                tau = tau_from_kl(target_delta, total_tokens)
-                if hasattr(self, "_ebc_tau_scale"):
-                    tau = tau * float(self._ebc_tau_scale)
+                base_tau = tau_from_kl(target_delta, total_tokens)
+                # Apply guard scale (shrink-only)
+                tau_eff = base_tau * float(self._ebc_tau_scale)
 
                 # Update beta estimates every N steps, probing K layers round-robin
                 if (self.step % self.config.ebc_update_every) == 0:
@@ -230,10 +232,12 @@ class Trainer:
                 # Apply clipping
                 # Compute clipping coefficient c against the EFFECTIVE step (lr * updates_raw)
                 updates_for_S = jax.tree.map(lambda g: lr * g, updates_raw)
+                # Apply surrogate calibration by dividing tau by current scale
+                tau_for_clip = tau_eff / float(self._ebc_surr_scale)
                 _ignore, S, c = apply_ebc_clipping(
                     updates_for_S,
                     self._ebc_betas,
-                    tau,
+                    tau_for_clip,
                     self._ebc_scope_idx,
                     safety=float(self.config.ebc_safety),
                     aggregate=self.config.ebc_aggregate,
@@ -254,7 +258,7 @@ class Trainer:
                 beta_mean = float(sum(beta_vals) / max(1, len(beta_vals))) if beta_vals else None
                 beta_max = float(max(beta_vals)) if beta_vals else None
                 self._ebc_last = {
-                    "tau": float(tau),
+                    "tau": float(tau_eff),
                     "S": float(S),
                     "S_raw": float(S_raw_val),
                     "c": float(c),
@@ -263,6 +267,7 @@ class Trainer:
                     "lr": float(lr),
                     "scoped_layers": int(len(self._ebc_scope_idx) if self._ebc_scope_idx is not None else 0),
                     "tau_scale": float(self._ebc_tau_scale),
+                    "surr_scale": float(self._ebc_surr_scale),
                 }
 
                 # Periodic controller probe: shadow-apply current c*updates and measure applied KL
@@ -324,6 +329,15 @@ class Trainer:
                         else:
                             # faster recovery toward 1.0 when comfortably within bound
                             self._ebc_tau_scale = min(1.0, float(self._ebc_tau_scale) * self._ebc_tau_recover_rate)
+
+                    # Surrogate calibration: adjust S scale toward rho**exp (so that next time S_eff ≈ rho*S)
+                    if bool(getattr(self.config, "ebc_surr_calib_enable", True)) and (self.step >= int(getattr(self.config, "ebc_surr_calib_warmup", 0))):
+                        exp_s = float(getattr(self.config, "ebc_surr_calib_exp", 1.0))
+                        beta = float(getattr(self.config, "ebc_surr_calib_beta", 0.2))
+                        floor = float(getattr(self.config, "ebc_surr_calib_floor", 0.25))
+                        ceil = float(getattr(self.config, "ebc_surr_calib_ceiling", 8.0))
+                        target = float(max(floor, min(ceil, rho ** max(0.0, exp_s))))
+                        self._ebc_surr_scale = (1.0 - beta) * float(self._ebc_surr_scale) + beta * target
 
                     # PI controller in log space for per-token KL target
                     delta_star = float(self._ebc_ctrl_delta)

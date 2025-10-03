@@ -106,6 +106,23 @@ def parse_config_from_json(config_dict):
         # 0.5 means 1/sqrt(rho), 1.0 means 1/rho
         config.ebc_tau_shrink_exponent = 0.5
 
+    # Surrogate S calibration (scale S to match measured T)
+    if not hasattr(config, "ebc_surr_calib_enable"):
+        config.ebc_surr_calib_enable = True
+    if not hasattr(config, "ebc_surr_calib_beta"):
+        # EMA fraction toward target scale per probe (0..1]
+        config.ebc_surr_calib_beta = 0.2
+    if not hasattr(config, "ebc_surr_calib_exp"):
+        # exponent on rho when mapping to scale: target = rho**exp
+        config.ebc_surr_calib_exp = 1.0
+    if not hasattr(config, "ebc_surr_calib_floor"):
+        config.ebc_surr_calib_floor = 0.25
+    if not hasattr(config, "ebc_surr_calib_ceiling"):
+        config.ebc_surr_calib_ceiling = 8.0
+    if not hasattr(config, "ebc_surr_calib_warmup"):
+        # wait this many steps before adjusting surrogate scale
+        config.ebc_surr_calib_warmup = 0
+
     # Trainer defaults
     if not hasattr(config, "pre_dualize"):
         config.pre_dualize = False

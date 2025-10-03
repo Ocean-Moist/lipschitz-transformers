@@ -53,6 +53,8 @@ class Trainer:
         # EBC robust beta settings
         self._ebc_beta_huber_delta = float(getattr(self.config, "ebc_beta_huber_delta", 0.0))
         self._ebc_beta_full_sweep = int(getattr(self.config, "ebc_beta_full_sweep", 200))
+        # Additional shrink-only guard: multiplicative scale on tau
+        self._ebc_tau_scale = 1.0
 
     def _ckpt_paths(self):
         ckdir = Path(getattr(self.config, "ckpt_dir", Path(self.config.output_dir) / "ckpts"))
@@ -164,6 +166,8 @@ class Trainer:
                     float(self._ebc_ctrl_delta) if self._ebc_ctrl_enable else float(self.config.ebc_target_kl)
                 )
                 tau = tau_from_kl(target_delta, total_tokens)
+                if hasattr(self, "_ebc_tau_scale"):
+                    tau = tau * float(self._ebc_tau_scale)
 
                 # Update beta estimates every N steps, probing K layers round-robin
                 if (self.step % self.config.ebc_update_every) == 0:
@@ -251,6 +255,7 @@ class Trainer:
                     "beta_max": beta_max,
                     "lr": float(lr),
                     "scoped_layers": int(len(self._ebc_scope_idx) if self._ebc_scope_idx is not None else 0),
+                    "tau_scale": float(self._ebc_tau_scale),
                 }
 
                 # Periodic controller probe: shadow-apply current c*updates and measure applied KL
@@ -296,8 +301,13 @@ class Trainer:
                     S_probe = float(S_probe_val)
                     rho = float(T / max(float(c) * S_probe + eps, eps))
                     if do_adjust and rho > 1.0:
-                        # shrinking tau is equivalent to shrinking delta by rho^2
                         self._ebc_ctrl_logdelta -= 2.0 * float(jnp.log(rho))
+                    # shrink-only multiplicative guard on tau, independent of delta bounds
+                    if rho > 1.0:
+                        self._ebc_tau_scale = min(float(self._ebc_tau_scale), float(1.0 / rho))
+                    else:
+                        # gentle recovery toward 1.0
+                        self._ebc_tau_scale = min(1.0, float(self._ebc_tau_scale) * 1.02)
 
                     # PI controller in log space for per-token KL target
                     delta_star = float(self._ebc_ctrl_delta)

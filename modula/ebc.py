@@ -8,8 +8,7 @@ def pytree_rms_norm(tree) -> jnp.ndarray:
     if not leaves:
         return jnp.array(0.0)
     total_sq = sum(jnp.sum(jnp.square(x)) for x in leaves)
-    total_n = sum(x.size for x in leaves)
-    return jnp.sqrt(total_sq / (total_n + 1e-12))
+    return jnp.sqrt(total_sq)
 
 
 def centered_logit_norm(delta_logits: jnp.ndarray) -> jnp.ndarray:

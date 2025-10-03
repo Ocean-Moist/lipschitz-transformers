@@ -192,6 +192,9 @@ def make_config(
         ebc_delta_star=float(args.ebc_delta_star) if getattr(args, "ebc_delta_star", None) is not None else args.ebc_target_kl,
         ebc_ctrl_delta_min=float(getattr(args, "ebc_ctrl_delta_min", 0.01)),
         ebc_ctrl_delta_max=float(getattr(args, "ebc_ctrl_delta_max", 0.30)),
+        # EBC robust betas
+        ebc_beta_huber_delta=float(getattr(args, "ebc_beta_huber_delta", 0.0)),
+        ebc_beta_full_sweep=int(getattr(args, "ebc_beta_full_sweep", 200)),
         # Misc
         jit=bool(args.jit),  # enable with --jit; default False due to RoPE tracer note
         output_dir=str(out_root),
@@ -1163,6 +1166,9 @@ def main():
     p.add_argument("--ebc_delta_star", type=float, default=None, help="Target per-token KL (nats/token) for controller; defaults to --ebc_target_kl")
     p.add_argument("--ebc_ctrl_delta_min", type=float, default=0.01, help="Min bound for controller's delta")
     p.add_argument("--ebc_ctrl_delta_max", type=float, default=0.30, help="Max bound for controller's delta")
+    # EBC robust beta knobs
+    p.add_argument("--ebc_beta_huber_delta", type=float, default=0.0, help="Huber clipping delta for beta residuals (0 to disable)")
+    p.add_argument("--ebc_beta_full_sweep", type=int, default=200, help="Full beta refresh period in steps (0 to disable)")
     # Grid options
     p.add_argument("--optimizers", type=str, default="adam,muon")
     p.add_argument("--spectral", type=str, default="none,spec", help="none or spec, comma-separated")

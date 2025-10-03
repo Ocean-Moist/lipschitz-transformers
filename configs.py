@@ -56,6 +56,12 @@ def parse_config_from_json(config_dict):
         config.ebc_probe_layers = 2
     if not hasattr(config, "ebc_beta_ema"):
         config.ebc_beta_ema = 0.9
+    if not hasattr(config, "ebc_beta_huber_delta"):
+        # Set to 0 to disable Huber; >0 applies clipped residual against EMA
+        config.ebc_beta_huber_delta = 0.0
+    if not hasattr(config, "ebc_beta_full_sweep"):
+        # Full beta refresh period in steps (0 to disable)
+        config.ebc_beta_full_sweep = 200
     if not hasattr(config, "ebc_safety"):
         config.ebc_safety = 1.05
     if not hasattr(config, "ebc_aggregate"):

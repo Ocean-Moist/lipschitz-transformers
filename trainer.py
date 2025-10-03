@@ -50,6 +50,9 @@ class Trainer:
         self._ebc_ctrl_delta = float(getattr(self.config, "ebc_delta_star", getattr(self.config, "ebc_target_kl", 0.05)))
         self._ebc_ctrl_logdelta = float(jnp.log(max(self._ebc_ctrl_delta, 1e-8)))
         self._ebc_ctrl_ema_e = 0.0
+        # EBC robust beta settings
+        self._ebc_beta_huber_delta = float(getattr(self.config, "ebc_beta_huber_delta", 0.0))
+        self._ebc_beta_full_sweep = int(getattr(self.config, "ebc_beta_full_sweep", 200))
 
     def _ckpt_paths(self):
         ckdir = Path(getattr(self.config, "ckpt_dir", Path(self.config.output_dir) / "ckpts"))
@@ -123,8 +126,8 @@ class Trainer:
             if self.config.pre_dualize:
                 grads = self.model.dualize(grads)
 
-            # Update optimizer state and get parameter updates
-            _, opt_state, updates = self.optimizer.update(params, grads, opt_state)
+            # Update optimizer state and get parameter updates (raw, pre-EBC)
+            _, opt_state, updates_raw = self.optimizer.update(params, grads, opt_state)
 
             # Apply post-dualization if needed
             if self.config.post_dualize:
@@ -171,24 +174,56 @@ class Trainer:
                             self.model,
                             params,
                             idx,
-                            updates[idx],
+                            updates_raw[idx],
                             self._ebc_probe_inputs,
                             center_logits=self.config.ebc_center_logits,
                         )
                         # EMA update
                         ema = float(self.config.ebc_beta_ema)
-                        self._ebc_betas[idx] = float(ema) * float(self._ebc_betas[idx]) + (1.0 - float(ema)) * float(beta_hat)
+                        prev = float(self._ebc_betas[idx])
+                        bh = float(beta_hat)
+                        if self._ebc_beta_huber_delta > 0.0:
+                            # Huber on residual relative to EMA
+                            r = bh - prev
+                            delta = self._ebc_beta_huber_delta
+                            if abs(r) > delta:
+                                r = delta if r > 0 else -delta
+                            bh = prev + r
+                        self._ebc_betas[idx] = float(ema) * prev + (1.0 - float(ema)) * bh
                     self._ebc_probe_pos = (self._ebc_probe_pos + k) % max(1, len(self._ebc_scope_idx))
 
+                # Periodic full sweep to limit beta drift/noise
+                if self._ebc_beta_full_sweep and (self.step % self._ebc_beta_full_sweep == 0):
+                    ema = float(self.config.ebc_beta_ema)
+                    for idx in (self._ebc_scope_idx or []):
+                        beta_hat = estimate_beta_jvp(
+                            self.model,
+                            params,
+                            idx,
+                            updates_raw[idx],
+                            self._ebc_probe_inputs,
+                            center_logits=self.config.ebc_center_logits,
+                        )
+                        prev = float(self._ebc_betas[idx])
+                        bh = float(beta_hat)
+                        if self._ebc_beta_huber_delta > 0.0:
+                            r = bh - prev
+                            delta = self._ebc_beta_huber_delta
+                            if abs(r) > delta:
+                                r = delta if r > 0 else -delta
+                            bh = prev + r
+                        self._ebc_betas[idx] = float(ema) * prev + (1.0 - float(ema)) * bh
+
                 # Apply clipping
-                updates, S, c = apply_ebc_clipping(
-                    updates,
+                updates_clipped, S, c = apply_ebc_clipping(
+                    updates_raw,
                     self._ebc_betas,
                     tau,
                     self._ebc_scope_idx,
                     safety=float(self.config.ebc_safety),
                     aggregate=self.config.ebc_aggregate,
                 )
+                updates = updates_clipped
                 # Stash EBC internals for logging
                 self._ebc_last = {
                     "tau": float(tau),
@@ -201,8 +236,8 @@ class Trainer:
                 if self._ebc_ctrl_enable and (self.step % max(1, self._ebc_ctrl_period) == 0):
                     # shadow params before mutation
                     params_before = params
-                    # create shadow-updated params: apply step without decay/projection
-                    c_updates = jax.tree.map(lambda g: c * g, updates)
+                    # create shadow-updated params using RAW optimizer updates scaled by current c
+                    c_updates = jax.tree.map(lambda g: c * g, updates_raw)
                     params_plus = self.model.step(params_before, c_updates, lr)
 
                     # logits on probe batch (center per token)
@@ -226,7 +261,16 @@ class Trainer:
 
                     # guard on applied quantities (shrink-only)
                     eps = 1e-12
-                    S_probe = float(S)  # surrogate is input-independent given betas
+                    # recompute surrogate S on raw updates (input-independent given betas)
+                    _clipped_probe, S_probe_val, _ = apply_ebc_clipping(
+                        updates_raw,
+                        self._ebc_betas,
+                        jnp.array(1e9, dtype=jnp.float32),
+                        self._ebc_scope_idx,
+                        safety=float(self.config.ebc_safety),
+                        aggregate=self.config.ebc_aggregate,
+                    )
+                    S_probe = float(S_probe_val)
                     rho = float(T / max(float(c) * S_probe + eps, eps))
                     if rho > 1.0:
                         # shrinking tau is equivalent to shrinking delta by rho^2

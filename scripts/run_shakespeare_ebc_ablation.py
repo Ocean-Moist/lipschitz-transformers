@@ -43,6 +43,9 @@ class AblationLogger:
         self.losses: List[float] = []
         self.train_accs: List[float] = []
         self.ebc_c: List[float] = []
+        self.ebc_applied_kl: List[float] = []
+        self.ebc_delta_ctrl: List[float] = []
+        self.ebc_rho: List[float] = []
         self.wall_times: List[float] = []
         self._t0 = time.time()
 
@@ -51,9 +54,18 @@ class AblationLogger:
         self.losses.append(float(loss))
         self.train_accs.append(float(accuracy))
         c = None
+        applied_kl = None
+        delta_ctrl = None
+        rho = None
         if isinstance(log, dict) and "ebc" in log and isinstance(log["ebc"], dict):
             c = log["ebc"].get("c")
+            applied_kl = log["ebc"].get("applied_kl")
+            delta_ctrl = log["ebc"].get("delta_ctrl")
+            rho = log["ebc"].get("rho")
         self.ebc_c.append(None if c is None else float(c))
+        self.ebc_applied_kl.append(None if applied_kl is None else float(applied_kl))
+        self.ebc_delta_ctrl.append(None if delta_ctrl is None else float(delta_ctrl))
+        self.ebc_rho.append(None if rho is None else float(rho))
         self.wall_times.append(time.time() - self._t0)
 
     def log_validation(self, step, metrics):
@@ -61,11 +73,32 @@ class AblationLogger:
         pass
 
     def get_results(self):
+        # compute c statistics
+        cs = [c for c in self.ebc_c if c is not None]
+        c_p10 = c_p50 = c_p90 = None
+        eta_eff_mean = eta_eff_median = None
+        if cs:
+            import numpy as _np
+            arr = _np.array(cs)
+            c_p10 = float(_np.percentile(arr, 10))
+            c_p50 = float(_np.percentile(arr, 50))
+            c_p90 = float(_np.percentile(arr, 90))
+            lr = float(getattr(self.config, "lr", 0.0))
+            eta_eff_mean = float(arr.mean() * lr)
+            eta_eff_median = float(_np.median(arr) * lr)
         return {
             "steps": self.steps,
             "train_losses": self.losses,
             "train_accs": self.train_accs,
             "ebc_c": self.ebc_c,
+            "ebc_applied_kl": self.ebc_applied_kl,
+            "ebc_delta_ctrl": self.ebc_delta_ctrl,
+            "ebc_rho": self.ebc_rho,
+            "c_p10": c_p10,
+            "c_p50": c_p50,
+            "c_p90": c_p90,
+            "eta_eff_mean": eta_eff_mean,
+            "eta_eff_median": eta_eff_median,
             "wall_times": self.wall_times,
         }
 
@@ -224,6 +257,11 @@ def run_one(config_dict: Dict[str, Any]):
     no_clip_rate = None
     clip_rate = None
     avg_c = None
+    c_p10 = history.get("c_p10")
+    c_p50 = history.get("c_p50")
+    c_p90 = history.get("c_p90")
+    eta_eff_mean = history.get("eta_eff_mean")
+    eta_eff_median = history.get("eta_eff_median")
     if cs:
         no_clip_rate = float(sum(1 for c in cs if c >= 0.999) / len(cs))
         clip_rate = 1.0 - no_clip_rate
@@ -239,6 +277,11 @@ def run_one(config_dict: Dict[str, Any]):
         "no_clip_rate": no_clip_rate,
         "clip_rate": clip_rate,
         "avg_c": avg_c,
+        "c_p10": c_p10,
+        "c_p50": c_p50,
+        "c_p90": c_p90,
+        "eta_eff_mean": eta_eff_mean,
+        "eta_eff_median": eta_eff_median,
     }
     # Mark job as done for resume detection
     try:

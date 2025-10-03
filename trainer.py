@@ -217,15 +217,18 @@ class Trainer:
                         self._ebc_betas[idx] = float(ema) * prev + (1.0 - float(ema)) * bh
 
                 # Apply clipping
-                updates_clipped, S, c = apply_ebc_clipping(
-                    updates_raw,
+                # Compute clipping coefficient c against the EFFECTIVE step (lr * updates_raw)
+                updates_for_S = jax.tree.map(lambda g: lr * g, updates_raw)
+                _ignore, S, c = apply_ebc_clipping(
+                    updates_for_S,
                     self._ebc_betas,
                     tau,
                     self._ebc_scope_idx,
                     safety=float(self.config.ebc_safety),
                     aggregate=self.config.ebc_aggregate,
                 )
-                updates = updates_clipped
+                # Apply c to raw updates; the model step will multiply by lr once
+                updates = jax.tree.map(lambda g: c * g, updates_raw)
                 # Stash EBC internals for logging
                 self._ebc_last = {
                     "tau": float(tau),
@@ -264,8 +267,9 @@ class Trainer:
                     # guard on applied quantities (shrink-only)
                     eps = 1e-12
                     # recompute surrogate S on raw updates (input-independent given betas)
+                    # Compute S on the effective step (lr * updates_raw)
                     _clipped_probe, S_probe_val, _ = apply_ebc_clipping(
-                        updates_raw,
+                        updates_for_S,
                         self._ebc_betas,
                         jnp.array(1e9, dtype=jnp.float32),
                         self._ebc_scope_idx,

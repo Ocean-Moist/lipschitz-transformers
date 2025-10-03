@@ -93,6 +93,19 @@ def parse_config_from_json(config_dict):
         # If True, compute and log applied_KL/rho every log_interval for diagnostics
         config.ebc_ctrl_log_every = False
 
+    # EBC guard defaults (shrink-only tau scaling)
+    if not hasattr(config, "ebc_guard_warmup_steps"):
+        config.ebc_guard_warmup_steps = 100
+    if not hasattr(config, "ebc_tau_scale_floor"):
+        config.ebc_tau_scale_floor = 0.05
+    if not hasattr(config, "ebc_tau_max_shrink_per_probe"):
+        config.ebc_tau_max_shrink_per_probe = 4.0
+    if not hasattr(config, "ebc_tau_recover_rate"):
+        config.ebc_tau_recover_rate = 1.10
+    if not hasattr(config, "ebc_tau_shrink_exponent"):
+        # 0.5 means 1/sqrt(rho), 1.0 means 1/rho
+        config.ebc_tau_shrink_exponent = 0.5
+
     # Trainer defaults
     if not hasattr(config, "pre_dualize"):
         config.pre_dualize = False

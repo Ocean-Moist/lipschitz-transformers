@@ -54,7 +54,14 @@ class Trainer:
         self._ebc_beta_huber_delta = float(getattr(self.config, "ebc_beta_huber_delta", 0.0))
         self._ebc_beta_full_sweep = int(getattr(self.config, "ebc_beta_full_sweep", 200))
         # Additional shrink-only guard: multiplicative scale on tau
+        # Starts at 1.0 and can shrink when measured logit change exceeds surrogate.
         self._ebc_tau_scale = 1.0
+        # Guard parameters exposed via config (with defaults set in configs.py)
+        self._ebc_tau_scale_floor = float(getattr(self.config, "ebc_tau_scale_floor", 0.05))
+        self._ebc_tau_max_shrink_per_probe = float(getattr(self.config, "ebc_tau_max_shrink_per_probe", 4.0))
+        self._ebc_tau_recover_rate = float(getattr(self.config, "ebc_tau_recover_rate", 1.10))
+        self._ebc_guard_warmup_steps = int(getattr(self.config, "ebc_guard_warmup_steps", 100))
+        self._ebc_tau_shrink_exponent = float(getattr(self.config, "ebc_tau_shrink_exponent", 0.5))
 
     def _ckpt_paths(self):
         ckdir = Path(getattr(self.config, "ckpt_dir", Path(self.config.output_dir) / "ckpts"))
@@ -303,11 +310,20 @@ class Trainer:
                     if do_adjust and rho > 1.0:
                         self._ebc_ctrl_logdelta -= 2.0 * float(jnp.log(rho))
                     # shrink-only multiplicative guard on tau, independent of delta bounds
-                    if rho > 1.0:
-                        self._ebc_tau_scale = min(float(self._ebc_tau_scale), float(1.0 / rho))
-                    else:
-                        # gentle recovery toward 1.0
-                        self._ebc_tau_scale = min(1.0, float(self._ebc_tau_scale) * 1.02)
+                    # Use a milder shrink (sqrt of rho), limit per-probe shrink, and apply after warmup
+                    if self.step >= self._ebc_guard_warmup_steps:
+                        if rho > 1.0:
+                            # shrink exponent: 0.5 -> sqrt, 1.0 -> linear
+                            exp = max(0.1, min(1.0, float(self._ebc_tau_shrink_exponent)))
+                            target_scale = float(1.0 / (rho ** exp))
+                            # limit per-probe shrink
+                            per_probe_limit = max(self._ebc_tau_scale / self._ebc_tau_max_shrink_per_probe, target_scale)
+                            new_scale = min(float(self._ebc_tau_scale), per_probe_limit)
+                            # enforce floor
+                            self._ebc_tau_scale = max(self._ebc_tau_scale_floor, new_scale)
+                        else:
+                            # faster recovery toward 1.0 when comfortably within bound
+                            self._ebc_tau_scale = min(1.0, float(self._ebc_tau_scale) * self._ebc_tau_recover_rate)
 
                     # PI controller in log space for per-token KL target
                     delta_star = float(self._ebc_ctrl_delta)

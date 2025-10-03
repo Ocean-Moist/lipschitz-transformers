@@ -47,6 +47,7 @@ class AblationLogger:
         self.ebc_delta_ctrl: List[float] = []
         self.ebc_rho: List[float] = []
         self.ebc_tau: List[float] = []
+        self.ebc_tau_scale: List[float] = []
         self.ebc_S: List[float] = []
         self.ebc_S_raw: List[float] = []
         self.ebc_beta_mean: List[float] = []
@@ -75,6 +76,7 @@ class AblationLogger:
             delta_ctrl = log["ebc"].get("delta_ctrl")
             rho = log["ebc"].get("rho")
             tau = log["ebc"].get("tau")
+            tau_scale = log["ebc"].get("tau_scale")
             S = log["ebc"].get("S")
             S_raw = log["ebc"].get("S_raw")
             beta_mean = log["ebc"].get("beta_mean")
@@ -85,6 +87,7 @@ class AblationLogger:
         self.ebc_delta_ctrl.append(None if delta_ctrl is None else float(delta_ctrl))
         self.ebc_rho.append(None if rho is None else float(rho))
         self.ebc_tau.append(None if tau is None else float(tau))
+        self.ebc_tau_scale.append(None if tau_scale is None else float(tau_scale))
         self.ebc_S.append(None if S is None else float(S))
         self.ebc_S_raw.append(None if S_raw is None else float(S_raw))
         self.ebc_beta_mean.append(None if beta_mean is None else float(beta_mean))
@@ -119,6 +122,7 @@ class AblationLogger:
             "ebc_delta_ctrl": self.ebc_delta_ctrl,
             "ebc_rho": self.ebc_rho,
             "ebc_tau": self.ebc_tau,
+            "ebc_tau_scale": self.ebc_tau_scale,
             "ebc_S": self.ebc_S,
             "ebc_S_raw": self.ebc_S_raw,
             "ebc_beta_mean": self.ebc_beta_mean,
@@ -223,6 +227,12 @@ def make_config(
         ebc_ctrl_delta_min=float(getattr(args, "ebc_ctrl_delta_min", 0.01)),
         ebc_ctrl_delta_max=float(getattr(args, "ebc_ctrl_delta_max", 0.30)),
         ebc_ctrl_log_every=bool(getattr(args, "ebc_ctrl_log_every", False)),
+        # EBC guard params
+        ebc_guard_warmup_steps=int(getattr(args, "ebc_guard_warmup_steps", 100)),
+        ebc_tau_scale_floor=float(getattr(args, "ebc_tau_scale_floor", 0.05)),
+        ebc_tau_max_shrink_per_probe=float(getattr(args, "ebc_tau_max_shrink_per_probe", 4.0)),
+        ebc_tau_recover_rate=float(getattr(args, "ebc_tau_recover_rate", 1.10)),
+        ebc_tau_shrink_exponent=float(getattr(args, "ebc_tau_shrink_exponent", 0.5)),
         # EBC robust betas
         ebc_beta_huber_delta=float(getattr(args, "ebc_beta_huber_delta", 0.0)),
         ebc_beta_full_sweep=int(getattr(args, "ebc_beta_full_sweep", 200)),
@@ -768,9 +778,137 @@ def run_auto_pipeline(args, out_dir: Path):
                 ],
                 "notes": notes,
             }
-            winners[key] = winner_info
-            if winner_info is None:
-                print(f"  -> No viable delta found for {key}")
+    winners[key] = winner_info
+    if winner_info is None:
+        print(f"  -> No viable delta found for {key}")
+
+    # Stage 2c: Controller/guard sweep (optional)
+    chosen_ctrl: Dict[Tuple[str, str], Optional[Dict[str, Any]]] = { (o, s): None for o in optimizers for s in spectral_opts }
+    if getattr(args, "auto_ctrl_search", False):
+        print("[auto] Controller/guard sweep:")
+        kps = [float(x) for x in str(getattr(args, "ctrl_kps", "")).split(",") if x.strip()]
+        kis = [float(x) for x in str(getattr(args, "ctrl_kis", "")).split(",") if x.strip()]
+        hls = [float(x) for x in str(getattr(args, "ctrl_halflifes", "")).split(",") if x.strip()]
+        dmins = [float(x) for x in str(getattr(args, "ctrl_delta_mins", "")).split(",") if x.strip()]
+        dmaxs = [float(x) for x in str(getattr(args, "ctrl_delta_maxs", "")).split(",") if x.strip()]
+        floors = [float(x) for x in str(getattr(args, "guard_floors", "")).split(",") if x.strip()]
+        exps = [float(x) for x in str(getattr(args, "guard_shrink_exponents", "")).split(",") if x.strip()]
+
+        ctrl_tasks: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        for opt in optimizers:
+            for spec in spectral_opts:
+                key = (opt, spec)
+                w = winners.get(key)
+                if not w or skip_bases.get(key, False):
+                    continue
+                spec_bool = (spec == "spec")
+                base_lr = best_lr[key][1]["lr"] if key in best_lr else args.lr
+                for kp in kps:
+                    for ki in kis:
+                        for hl in hls:
+                            for dm in dmins:
+                                for dx in dmaxs:
+                                    for fl in floors:
+                                        for ex in exps:
+                                            meta = {
+                                                "stage": "ctrl",
+                                                "optimizer": opt,
+                                                "spectral": spec,
+                                                "ebc": "on",
+                                                "delta": w["delta"],
+                                                "aggregate": w["aggregate"],
+                                                "lr": base_lr,
+                                                "kp": kp,
+                                                "ki": ki,
+                                                "hl": hl,
+                                                "dmin": dm,
+                                                "dmax": dx,
+                                                "floor": fl,
+                                                "exp": ex,
+                                            }
+                                            label = (
+                                                f"ctrl_{job_label(meta)}_kp{str(kp).replace('.', 'p')}_ki{str(ki).replace('.', 'p')}"
+                                            )
+                                            cfg = make_config(
+                                                clone_args(
+                                                    warm_args,
+                                                    lr=base_lr,
+                                                    ebc_ctrl_kp=kp,
+                                                    ebc_ctrl_ki=ki,
+                                                    ebc_ctrl_ema_halflife=hl,
+                                                    ebc_ctrl_delta_min=dm,
+                                                    ebc_ctrl_delta_max=dx,
+                                                    ebc_guard_warmup_steps=args.ebc_guard_warmup_steps,
+                                                    ebc_tau_scale_floor=fl,
+                                                    ebc_tau_max_shrink_per_probe=args.ebc_tau_max_shrink_per_probe,
+                                                    ebc_tau_recover_rate=args.ebc_tau_recover_rate,
+                                                    ebc_tau_shrink_exponent=ex,
+                                                ),
+                                                opt,
+                                                ebc=True,
+                                                spectral=spec_bool,
+                                                delta=w["delta"],
+                                                aggregate=w["aggregate"],
+                                                run_dir=out_dir,
+                                                job_id=label,
+                                            )
+                                            ctrl_tasks.append((meta, cfg))
+        ctrl_results: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        if ctrl_tasks:
+            ctrl_results = launch_queue(ctrl_tasks)
+
+        # Score and choose
+        # Objective: minimize (|clip_rate-target|, KL tracking error, warmup val)
+        chosen_ctrl = { (o, s): None for o in optimizers for s in spectral_opts }
+        if ctrl_results:
+            clip_target = clip_target
+            def _score(meta, res):
+                hist = res.get("history", {})
+                kl = [k for k in hist.get("ebc_applied_kl", []) if k is not None]
+                dstar = [d for d in hist.get("ebc_delta_ctrl", []) if d is not None]
+                rho = [r for r in hist.get("ebc_rho", []) if r is not None]
+                # tracking error (MAE)
+                if kl and dstar and len(kl) == len(dstar):
+                    import numpy as _np
+                    mae = float(_np.mean(_np.abs(_np.array(kl) - _np.array(dstar))))
+                else:
+                    mae = 1e3
+                # violation fraction
+                viol = 0.0
+                if rho:
+                    viol = float(sum(1 for r in rho if r > 1.2) / len(rho))
+                # clip deviation
+                clip = res.get("clip_rate")
+                if clip is None:
+                    clip = 1.0
+                dev = abs(float(clip) - float(clip_target))
+                # val loss
+                v = float(res.get("val_loss", 1e6))
+                # weighted score
+                return 3.0*dev + 5.0*mae + 1.0*viol + 0.5*v
+
+            print("[auto] Controller candidates:")
+            buckets: Dict[Tuple[str, str], List[Tuple[float, Dict[str, Any], Dict[str, Any]]]] = {}
+            for meta, res in ctrl_results:
+                key = (meta["optimizer"], meta["spectral"])
+                s = _score(meta, res)
+                buckets.setdefault(key, []).append((s, meta, res))
+                print(
+                    f"  {key} kp={meta['kp']} ki={meta['ki']} hl={meta['hl']} dmin={meta['dmin']} dmax={meta['dmax']} floor={meta['floor']} exp={meta['exp']} -> score={s:.4f}, val={res.get('val_loss'):.4f}, clip={res.get('clip_rate')}"
+                )
+            for key, lst in buckets.items():
+                lst.sort(key=lambda t: t[0])
+                best_score, best_meta, best_res = lst[0]
+                chosen_ctrl[key] = {
+                    "kp": best_meta["kp"],
+                    "ki": best_meta["ki"],
+                    "hl": best_meta["hl"],
+                    "dmin": best_meta["dmin"],
+                    "dmax": best_meta["dmax"],
+                    "floor": best_meta["floor"],
+                    "exp": best_meta["exp"],
+                }
+                print(f"[auto] Chosen ctrl for {key}: {chosen_ctrl[key]}")
 
     # Stage 2b: LR-scale sweep for EBC + paired control baselines
     scale_tasks: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
@@ -798,8 +936,27 @@ def run_auto_pipeline(args, out_dir: Path):
                     "lr_scale": s,
                 }
                 label_e = f"scale_{job_label(meta_e)}_x{str(s).replace('.', 'p')}"
+                # If controller search chose settings, inject them
+                if getattr(args, "auto_ctrl_search", False) and chosen_ctrl.get(key):
+                    ctrl = chosen_ctrl[key]
+                    ctrl_args = clone_args(
+                        warm_args,
+                        lr=lr_scaled,
+                        ebc_ctrl_kp=ctrl["kp"],
+                        ebc_ctrl_ki=ctrl["ki"],
+                        ebc_ctrl_ema_halflife=ctrl["hl"],
+                        ebc_ctrl_delta_min=ctrl["dmin"],
+                        ebc_ctrl_delta_max=ctrl["dmax"],
+                        ebc_guard_warmup_steps=args.ebc_guard_warmup_steps,
+                        ebc_tau_scale_floor=ctrl["floor"],
+                        ebc_tau_max_shrink_per_probe=args.ebc_tau_max_shrink_per_probe,
+                        ebc_tau_recover_rate=args.ebc_tau_recover_rate,
+                        ebc_tau_shrink_exponent=ctrl["exp"],
+                    )
+                else:
+                    ctrl_args = clone_args(warm_args, lr=lr_scaled)
                 cfg_e = make_config(
-                    clone_args(warm_args, lr=lr_scaled),
+                    ctrl_args,
                     opt,
                     ebc=True,
                     spectral=spec_bool,
@@ -935,8 +1092,26 @@ def run_auto_pipeline(args, out_dir: Path):
                 "lr": base_lr,
             }
             base_label = f"final_{job_label(base_meta)}"
+            if getattr(args, "auto_ctrl_search", False) and chosen_ctrl.get(key):
+                ctrl = chosen_ctrl[key]
+                final_base_args = clone_args(
+                    final_args,
+                    lr=base_lr,
+                    ebc_ctrl_kp=ctrl["kp"],
+                    ebc_ctrl_ki=ctrl["ki"],
+                    ebc_ctrl_ema_halflife=ctrl["hl"],
+                    ebc_ctrl_delta_min=ctrl["dmin"],
+                    ebc_ctrl_delta_max=ctrl["dmax"],
+                    ebc_guard_warmup_steps=args.ebc_guard_warmup_steps,
+                    ebc_tau_scale_floor=ctrl["floor"],
+                    ebc_tau_max_shrink_per_probe=args.ebc_tau_max_shrink_per_probe,
+                    ebc_tau_recover_rate=args.ebc_tau_recover_rate,
+                    ebc_tau_shrink_exponent=ctrl["exp"],
+                )
+            else:
+                final_base_args = clone_args(final_args, lr=base_lr)
             base_cfg = make_config(
-                clone_args(final_args, lr=base_lr),
+                final_base_args,
                 opt,
                 ebc=False,
                 spectral=spec_bool,
@@ -962,8 +1137,26 @@ def run_auto_pipeline(args, out_dir: Path):
                 "lr_scale": lr_scale,
             }
             ebc_label = f"final_{job_label(ebc_meta)}"
+            if getattr(args, "auto_ctrl_search", False) and chosen_ctrl.get(key):
+                ctrl = chosen_ctrl[key]
+                final_ebc_args = clone_args(
+                    final_args,
+                    lr=lr_ebc,
+                    ebc_ctrl_kp=ctrl["kp"],
+                    ebc_ctrl_ki=ctrl["ki"],
+                    ebc_ctrl_ema_halflife=ctrl["hl"],
+                    ebc_ctrl_delta_min=ctrl["dmin"],
+                    ebc_ctrl_delta_max=ctrl["dmax"],
+                    ebc_guard_warmup_steps=args.ebc_guard_warmup_steps,
+                    ebc_tau_scale_floor=ctrl["floor"],
+                    ebc_tau_max_shrink_per_probe=args.ebc_tau_max_shrink_per_probe,
+                    ebc_tau_recover_rate=args.ebc_tau_recover_rate,
+                    ebc_tau_shrink_exponent=ctrl["exp"],
+                )
+            else:
+                final_ebc_args = clone_args(final_args, lr=lr_ebc)
             ebc_cfg = make_config(
-                clone_args(final_args, lr=lr_ebc),
+                final_ebc_args,
                 opt,
                 ebc=True,
                 spectral=spec_bool,
@@ -1198,6 +1391,12 @@ def main():
     p.add_argument("--ebc_ctrl_delta_min", type=float, default=0.01, help="Min bound for controller's delta")
     p.add_argument("--ebc_ctrl_delta_max", type=float, default=0.30, help="Max bound for controller's delta")
     p.add_argument("--ebc_ctrl_log_every", action="store_true", help="Force logging applied-KL/rho each log step (diagnostic)")
+    # EBC guard parameters (shrink-only tau scaling)
+    p.add_argument("--ebc_guard_warmup_steps", type=int, default=100)
+    p.add_argument("--ebc_tau_scale_floor", type=float, default=0.05)
+    p.add_argument("--ebc_tau_max_shrink_per_probe", type=float, default=4.0)
+    p.add_argument("--ebc_tau_recover_rate", type=float, default=1.10)
+    p.add_argument("--ebc_tau_shrink_exponent", type=float, default=0.5)
     # EBC robust beta knobs
     p.add_argument("--ebc_beta_huber_delta", type=float, default=0.0, help="Huber clipping delta for beta residuals (0 to disable)")
     p.add_argument("--ebc_beta_full_sweep", type=int, default=200, help="Full beta refresh period in steps (0 to disable)")
@@ -1241,6 +1440,16 @@ def main():
     # Single-task worker mode (internal)
     p.add_argument("--single_task", type=Path, default=None)
     p.add_argument("--single_task_out", type=Path, default=None)
+
+    # Optional controller/guard sweep (Stage 2c)
+    p.add_argument("--auto_ctrl_search", action="store_true", help="Enable controller and guard grid search after delta selection")
+    p.add_argument("--ctrl_kps", type=str, default="0.1,0.15,0.2")
+    p.add_argument("--ctrl_kis", type=str, default="0.01,0.02")
+    p.add_argument("--ctrl_halflifes", type=str, default="150,250,400")
+    p.add_argument("--ctrl_delta_mins", type=str, default="0.005,0.01,0.02")
+    p.add_argument("--ctrl_delta_maxs", type=str, default="0.10,0.15")
+    p.add_argument("--guard_floors", type=str, default="0.05,0.10")
+    p.add_argument("--guard_shrink_exponents", type=str, default="0.5,0.75")
 
     args = p.parse_args()
     # Single-task worker mode

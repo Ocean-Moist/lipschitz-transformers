@@ -230,15 +230,32 @@ class Trainer:
                 # Apply c to raw updates; the model step will multiply by lr once
                 updates = jax.tree.map(lambda g: c * g, updates_raw)
                 # Stash EBC internals for logging
+                # Also compute S_raw (without lr) and beta stats for diagnostics
+                _ignore2, S_raw_val, _ = apply_ebc_clipping(
+                    updates_raw,
+                    self._ebc_betas,
+                    jnp.array(1e9, dtype=jnp.float32),
+                    self._ebc_scope_idx,
+                    safety=float(self.config.ebc_safety),
+                    aggregate=self.config.ebc_aggregate,
+                )
+                beta_vals = [float(b) for b in (self._ebc_betas or []) if b is not None]
+                beta_mean = float(sum(beta_vals) / max(1, len(beta_vals))) if beta_vals else None
+                beta_max = float(max(beta_vals)) if beta_vals else None
                 self._ebc_last = {
                     "tau": float(tau),
                     "S": float(S),
+                    "S_raw": float(S_raw_val),
                     "c": float(c),
+                    "beta_mean": beta_mean,
+                    "beta_max": beta_max,
+                    "lr": float(lr),
                     "scoped_layers": int(len(self._ebc_scope_idx) if self._ebc_scope_idx is not None else 0),
                 }
 
                 # Periodic controller probe: shadow-apply current c*updates and measure applied KL
-                if self._ebc_ctrl_enable and (self.step % max(1, self._ebc_ctrl_period) == 0):
+                if self._ebc_ctrl_enable and ((self.step % max(1, self._ebc_ctrl_period) == 0) or bool(getattr(self.config, "ebc_ctrl_log_every", False))):
+                    do_adjust = (self.step % max(1, self._ebc_ctrl_period) == 0)
                     # shadow params before mutation
                     params_before = params
                     # create shadow-updated params using RAW optimizer updates scaled by current c
@@ -278,7 +295,7 @@ class Trainer:
                     )
                     S_probe = float(S_probe_val)
                     rho = float(T / max(float(c) * S_probe + eps, eps))
-                    if rho > 1.0:
+                    if do_adjust and rho > 1.0:
                         # shrinking tau is equivalent to shrinking delta by rho^2
                         self._ebc_ctrl_logdelta -= 2.0 * float(jnp.log(rho))
 
@@ -293,13 +310,15 @@ class Trainer:
                     dt = max(1.0, float(self._ebc_ctrl_period))
                     alpha = 1.0 - math.exp(-math.log(2.0) * dt / hl)
                     self._ebc_ctrl_ema_e = (1.0 - alpha) * self._ebc_ctrl_ema_e + alpha * e
-                    self._ebc_ctrl_logdelta = self._ebc_ctrl_logdelta + self._ebc_ctrl_kp * e + self._ebc_ctrl_ki * self._ebc_ctrl_ema_e
+                    if do_adjust:
+                        self._ebc_ctrl_logdelta = self._ebc_ctrl_logdelta + self._ebc_ctrl_kp * e + self._ebc_ctrl_ki * self._ebc_ctrl_ema_e
                     # clamp delta
                     delta_min = float(getattr(self.config, "ebc_ctrl_delta_min", 0.01))
                     delta_max = float(getattr(self.config, "ebc_ctrl_delta_max", 0.30))
                     new_delta = float(jnp.clip(jnp.exp(self._ebc_ctrl_logdelta), delta_min, delta_max))
                     # store
-                    self._ebc_ctrl_delta = new_delta
+                    if do_adjust:
+                        self._ebc_ctrl_delta = new_delta
                     # extend logging
                     self._ebc_last["applied_kl"] = float(applied_kl)
                     self._ebc_last["rho"] = rho

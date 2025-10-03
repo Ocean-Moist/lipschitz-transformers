@@ -46,6 +46,12 @@ class AblationLogger:
         self.ebc_applied_kl: List[float] = []
         self.ebc_delta_ctrl: List[float] = []
         self.ebc_rho: List[float] = []
+        self.ebc_tau: List[float] = []
+        self.ebc_S: List[float] = []
+        self.ebc_S_raw: List[float] = []
+        self.ebc_beta_mean: List[float] = []
+        self.ebc_beta_max: List[float] = []
+        self.ebc_lr: List[float] = []
         self.wall_times: List[float] = []
         self._t0 = time.time()
 
@@ -62,10 +68,22 @@ class AblationLogger:
             applied_kl = log["ebc"].get("applied_kl")
             delta_ctrl = log["ebc"].get("delta_ctrl")
             rho = log["ebc"].get("rho")
+            tau = log["ebc"].get("tau")
+            S = log["ebc"].get("S")
+            S_raw = log["ebc"].get("S_raw")
+            beta_mean = log["ebc"].get("beta_mean")
+            beta_max = log["ebc"].get("beta_max")
+            lr = log["ebc"].get("lr")
         self.ebc_c.append(None if c is None else float(c))
         self.ebc_applied_kl.append(None if applied_kl is None else float(applied_kl))
         self.ebc_delta_ctrl.append(None if delta_ctrl is None else float(delta_ctrl))
         self.ebc_rho.append(None if rho is None else float(rho))
+        self.ebc_tau.append(None if tau is None else float(tau))
+        self.ebc_S.append(None if S is None else float(S))
+        self.ebc_S_raw.append(None if S_raw is None else float(S_raw))
+        self.ebc_beta_mean.append(None if beta_mean is None else float(beta_mean))
+        self.ebc_beta_max.append(None if beta_max is None else float(beta_max))
+        self.ebc_lr.append(None if lr is None else float(lr))
         self.wall_times.append(time.time() - self._t0)
 
     def log_validation(self, step, metrics):
@@ -94,6 +112,12 @@ class AblationLogger:
             "ebc_applied_kl": self.ebc_applied_kl,
             "ebc_delta_ctrl": self.ebc_delta_ctrl,
             "ebc_rho": self.ebc_rho,
+            "ebc_tau": self.ebc_tau,
+            "ebc_S": self.ebc_S,
+            "ebc_S_raw": self.ebc_S_raw,
+            "ebc_beta_mean": self.ebc_beta_mean,
+            "ebc_beta_max": self.ebc_beta_max,
+            "ebc_lr": self.ebc_lr,
             "c_p10": c_p10,
             "c_p50": c_p50,
             "c_p90": c_p90,
@@ -192,6 +216,7 @@ def make_config(
         ebc_delta_star=float(args.ebc_delta_star) if getattr(args, "ebc_delta_star", None) is not None else args.ebc_target_kl,
         ebc_ctrl_delta_min=float(getattr(args, "ebc_ctrl_delta_min", 0.01)),
         ebc_ctrl_delta_max=float(getattr(args, "ebc_ctrl_delta_max", 0.30)),
+        ebc_ctrl_log_every=bool(getattr(args, "ebc_ctrl_log_every", False)),
         # EBC robust betas
         ebc_beta_huber_delta=float(getattr(args, "ebc_beta_huber_delta", 0.0)),
         ebc_beta_full_sweep=int(getattr(args, "ebc_beta_full_sweep", 200)),
@@ -1166,6 +1191,7 @@ def main():
     p.add_argument("--ebc_delta_star", type=float, default=None, help="Target per-token KL (nats/token) for controller; defaults to --ebc_target_kl")
     p.add_argument("--ebc_ctrl_delta_min", type=float, default=0.01, help="Min bound for controller's delta")
     p.add_argument("--ebc_ctrl_delta_max", type=float, default=0.30, help="Max bound for controller's delta")
+    p.add_argument("--ebc_ctrl_log_every", action="store_true", help="Force logging applied-KL/rho each log step (diagnostic)")
     # EBC robust beta knobs
     p.add_argument("--ebc_beta_huber_delta", type=float, default=0.0, help="Huber clipping delta for beta residuals (0 to disable)")
     p.add_argument("--ebc_beta_full_sweep", type=int, default=200, help="Full beta refresh period in steps (0 to disable)")

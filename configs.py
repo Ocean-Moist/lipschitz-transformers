@@ -89,6 +89,9 @@ def parse_config_from_json(config_dict):
         config.ebc_ctrl_delta_min = 0.01
     if not hasattr(config, "ebc_ctrl_delta_max"):
         config.ebc_ctrl_delta_max = 0.30
+    if not hasattr(config, "ebc_ctrl_log_every"):
+        # If True, compute and log applied_KL/rho every log_interval for diagnostics
+        config.ebc_ctrl_log_every = False
 
     # Trainer defaults
     if not hasattr(config, "pre_dualize"):

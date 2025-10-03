@@ -65,6 +65,7 @@ class AblationLogger:
         delta_ctrl = None
         rho = None
         tau = None
+        tau_scale = None
         S = None
         S_raw = None
         beta_mean = None
